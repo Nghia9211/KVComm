@@ -1,11 +1,13 @@
 import torch
 import torch.nn.functional as F
 import logging
+import json
 from tqdm import tqdm
 import wandb
 from layer_importance import calc_layer_importance
 from collections import defaultdict
 import time
+from typing import Optional
 
 QA_INSTRUCTION = "Directly answer the question based on the context passage, no explanation is needed."
 MATH_INSTRUCTION = "Answer the math problem step by step."
@@ -181,10 +183,12 @@ class BaselineEvaluator(SkylineEvaluator):
         return input_ids
 
 class CommunicationEvaluator(SkylineEvaluator):
-    def __init__(self, evaluator, tokenizer, use_wandb, max_input_length):
+    def __init__(self, evaluator, tokenizer, use_wandb, max_input_length,
+                 response_log_path: Optional[str] = None):
         super().__init__(evaluator, tokenizer, use_wandb, max_input_length)
         self.name = "communication"
         self.layer_importance_total = defaultdict(list)
+        self.response_log_path = response_log_path
     
     def truncate_input(self, input_ids_A, input_ids_B):
         if input_ids_A.shape[-1] + input_ids_B.shape[-1] > self.max_input_length and self.evaluator.truncate_input:
@@ -242,20 +246,42 @@ class CommunicationEvaluator(SkylineEvaluator):
     def _test(self, model_A, cv, limit=None, do_calc_layer_importance=False):
         progress_bar = tqdm(self.evaluator, desc=f"{self.name} result: 0.0000", disable=do_calc_layer_importance)
 
-        for i, item in enumerate(progress_bar):
-            if limit is not None and i >= limit:
-                break
-            response = self.inference(model_A, cv, item)
+        # Open response log file once for the entire test run
+        response_log_file = None
+        if self.response_log_path and not do_calc_layer_importance:
+            response_log_file = open(self.response_log_path, "a", encoding="utf-8")
 
-            if do_calc_layer_importance:
-                cv.calc_attn_weights_from_qk()
-                self.layer_importance_total = calc_layer_importance(cv.B_attn_weights, model_A.name, self.layer_importance_total)
-            
-            self.evaluator.evaluate_item(item, response)
-            
-            result = self.evaluator.get_result()
-            progress_bar.set_description(f"{self.name} result: {result:.4f}")
-            
+        try:
+            for i, item in enumerate(progress_bar):
+                if limit is not None and i >= limit:
+                    break
+                response = self.inference(model_A, cv, item)
+
+                if do_calc_layer_importance:
+                    cv.calc_attn_weights_from_qk()
+                    self.layer_importance_total = calc_layer_importance(cv.B_attn_weights, model_A.name, self.layer_importance_total)
+
+                self.evaluator.evaluate_item(item, response)
+
+                result = self.evaluator.get_result()
+                progress_bar.set_description(f"{self.name} result: {result:.4f}")
+
+                # Write response log entry
+                if response_log_file is not None:
+                    record = {
+                        "idx": i,
+                        "prompt_a": item.get("prompt_A", ""),
+                        "prompt_b": item.get("prompt_B", ""),
+                        "response": response,
+                        "answer": item.get("answer", ""),
+                        "result_so_far": round(result, 4),
+                    }
+                    response_log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    response_log_file.flush()
+        finally:
+            if response_log_file is not None:
+                response_log_file.close()
+
         result = self.evaluator.get_result()
         return result
     

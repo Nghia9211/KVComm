@@ -46,6 +46,8 @@ import argparse
 import wandb
 import datetime
 import logging
+import random
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Literal
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -57,6 +59,7 @@ from eval import SkylineEvaluator, CommunicationEvaluator, BaselineEvaluator
 from eval_latent import LatentCommunicationEvaluator
 from utils import setup_logging, log_gpu_info, generate_run_name
 from dataloader import get_evaluator
+from layer_importance import get_top_layers, get_layer_ranking
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -94,6 +97,9 @@ class LatentAlignConfig:
     # latent_kv_select=False → Mode 1 (all layers, LatentMAS standalone)
     # latent_kv_select=True  → Mode 2 (layer selection via CVCommunicator)
     latent_kv_select: bool = False
+    # latent_only=False → B receives full T_input + N_latent KV tokens (backward-compat)
+    # latent_only=True  → B receives only the N_latent compressed thought tokens
+    latent_only: bool = False
 
     # ── Task ──────────────────────────────────────────────────────────────
     test_task: str = "tmath"
@@ -152,6 +158,10 @@ def main(cfg: LatentAlignConfig):
     logging.info(f"Configuration: {cfg}")
     logging.info(f"Outputs will be saved to: {final_snapshot_path}")
     log_gpu_info()
+
+    # Response log file (written alongside log.log in the same snapshot folder)
+    response_log_path = os.path.join(final_snapshot_path, "responses.jsonl")
+    logging.info(f"Response log will be saved to: {response_log_path}")
 
     # ── W&B ───────────────────────────────────────────────────────────────
     if cfg.use_wandb:
@@ -220,7 +230,8 @@ def main(cfg: LatentAlignConfig):
     if cfg.do_test:
         logging.info("Running regular KVComm evaluation (no latent)...")
         comm_evaluator = CommunicationEvaluator(
-            evaluator, tokenizer, cfg.use_wandb, cfg.max_input_length
+            evaluator, tokenizer, cfg.use_wandb, cfg.max_input_length,
+            response_log_path=response_log_path,
         )
         cv = CVCommunicator(
             model_A, model_B,
@@ -238,7 +249,9 @@ def main(cfg: LatentAlignConfig):
             f"Running LatentMAS evaluation: "
             f"latent_steps={cfg.latent_steps}, "
             f"latent_space_realign={cfg.latent_space_realign}, "
-            f"latent_kv_select={cfg.latent_kv_select}"
+            f"latent_kv_select={cfg.latent_kv_select}, "
+            f"top_layers={cfg.top_layers}, "
+            f"random_selection={cfg.random_selection}"
         )
 
         # Build LatentMAS wrapper for sender A
@@ -256,39 +269,212 @@ def main(cfg: LatentAlignConfig):
             else:
                 A_num_layers = model_A.config.text_config.num_hidden_layers
             latent_layers_list = list(range(A_num_layers))
+            if cfg.top_layers > 0:
+                logging.warning(
+                    "top_layers is set but latent_kv_select=False (Mode 1). "
+                    "Auto layer selection only applies to Mode 2 (--latent_kv_select). "
+                    "Ignoring top_layers and using all layers."
+                )
             logging.info(
                 f"Mode 1 (LatentMAS standalone): "
                 f"all {A_num_layers} layers selected (no KV layer selection)"
             )
-        else:
-            # Mode 2: user-specified layers → KVComm layer selection
-            latent_layers_list = cfg.layers_list
-            logging.info(
-                f"Mode 2 (KVComm + LatentMAS): "
-                f"layers_list={latent_layers_list}"
+
+            # Build CVCommunicator and evaluator for Mode 1
+            cv = CVCommunicator(
+                model_A, model_B,
+                cfg.layer_from, cfg.layer_to,
+                layers_list=latent_layers_list,
+                top_layers=0.0,
+                apply_attn_tracer=False,
+                shift_back=cfg.shift_back,
+            ).to(cfg.device)
+            latent_evaluator = LatentCommunicationEvaluator(
+                evaluator=evaluator,
+                tokenizer=tokenizer,
+                use_wandb=cfg.use_wandb,
+                max_input_length=cfg.max_input_length,
+                latent_mas=latent_mas,
+                cv=cv,
+                response_log_path=response_log_path,
             )
+            results = latent_evaluator.test(model_A, cv, limit=cfg.limit)
 
-        # Build CVCommunicator with the chosen layers_list
-        # Note: top_layers=0.0 because layers already determined above
-        cv = CVCommunicator(
-            model_A, model_B,
-            cfg.layer_from, cfg.layer_to,
-            layers_list=latent_layers_list,
-            top_layers=0.0,
-            apply_attn_tracer=False,
-            shift_back=cfg.shift_back,
-        ).to(cfg.device)
+        else:
+            # Mode 2: KVComm layer selection + LatentMAS
+            # ── Sub-mode: RANDOM selection ─────────────────────────────
+            if cfg.random_selection:
+                if hasattr(model_A.config, "num_hidden_layers"):
+                    A_num_layers = model_A.config.num_hidden_layers
+                else:
+                    A_num_layers = model_A.config.text_config.num_hidden_layers
+                n_select = max(1, int(cfg.top_layers * A_num_layers)) if cfg.top_layers > 0 else len(cfg.layers_list)
+                cfg.layers_list = random.sample(list(range(A_num_layers)), n_select)
+                logging.info(f"Mode 2 RANDOM: randomly selected layers_list={cfg.layers_list}")
 
-        # Build latent evaluator (asserts latent_mas.model is cv.A internally)
-        latent_evaluator = LatentCommunicationEvaluator(
-            evaluator=evaluator,
-            tokenizer=tokenizer,
-            use_wandb=cfg.use_wandb,
-            max_input_length=cfg.max_input_length,
-            latent_mas=latent_mas,
-            cv=cv,
-        )
-        results = latent_evaluator.test(model_A, cv, limit=cfg.limit)
+                cv = CVCommunicator(
+                    model_A, model_B,
+                    cfg.layer_from, cfg.layer_to,
+                    layers_list=cfg.layers_list,
+                    top_layers=0.0,
+                    apply_attn_tracer=False,
+                    shift_back=cfg.shift_back,
+                ).to(cfg.device)
+                latent_evaluator = LatentCommunicationEvaluator(
+                    evaluator=evaluator,
+                    tokenizer=tokenizer,
+                    use_wandb=cfg.use_wandb,
+                    max_input_length=cfg.max_input_length,
+                    latent_mas=latent_mas,
+                    cv=cv,
+                    latent_only=cfg.latent_only,
+                    response_log_path=response_log_path,
+                )
+                results = latent_evaluator.test(model_A, cv, limit=cfg.limit)
+
+            elif cfg.top_layers > 0:
+                # ── Sub-mode: AUTO selection (calibrate via LatentMAS) ──
+                # Get all layers for A to use during calibration
+                if hasattr(model_A.config, "num_hidden_layers"):
+                    A_num_layers = model_A.config.num_hidden_layers
+                else:
+                    A_num_layers = model_A.config.text_config.num_hidden_layers
+                calib_layers_list = list(range(A_num_layers))
+
+                # Step 1: Build calibration cv with attn_tracer=True (all layers)
+                logging.info(
+                    f"Mode 2 AUTO: calibrating layer importance over "
+                    f"{cfg.calib_size} sample(s) using LatentMAS forward..."
+                )
+                cv_calib = CVCommunicator(
+                    model_A, model_B,
+                    cfg.layer_from, cfg.layer_to,
+                    layers_list=calib_layers_list,
+                    top_layers=0.0,
+                    apply_attn_tracer=True,
+                    shift_back=cfg.shift_back,
+                ).to(cfg.device)
+
+                # Step 2: Build latent evaluator using cv_calib for assertion check
+                latent_evaluator = LatentCommunicationEvaluator(
+                    evaluator=evaluator,
+                    tokenizer=tokenizer,
+                    use_wandb=cfg.use_wandb,
+                    max_input_length=cfg.max_input_length,
+                    latent_mas=latent_mas,
+                    cv=cv_calib,
+                    latent_only=cfg.latent_only,
+                    response_log_path=response_log_path,
+                )
+
+                if not cfg.do_layer_curve:
+                    # Step 3a: Run calibration to collect layer importance
+                    latent_evaluator.test(
+                        model_A, cv_calib,
+                        limit=cfg.calib_size,
+                        no_wandb=True,
+                        do_calc_layer_importance=True,
+                    )
+
+                    # Step 4a: Compute top layers from attention importance
+                    cfg = get_top_layers(latent_evaluator.layer_importance_total, cfg)
+                    logging.info(f"Mode 2 AUTO: selected layers_list={cfg.layers_list}")
+
+                    # Step 5a: Rebuild cv with selected layers (attn_tracer already in model_B — harmless)
+                    cv = CVCommunicator(
+                        model_A, model_B,
+                        cfg.layer_from, cfg.layer_to,
+                        layers_list=cfg.layers_list,
+                        top_layers=0.0,
+                        apply_attn_tracer=False,
+                        shift_back=cfg.shift_back,
+                    ).to(cfg.device)
+
+                    # Step 6a: Reset layer importance and run actual evaluation
+                    latent_evaluator.layer_importance_total = defaultdict(list)
+                    results = latent_evaluator.test(model_A, cv, limit=cfg.limit)
+
+                else:
+                    # Step 3b (do_layer_curve): Calibrate → full layer ranking
+                    latent_evaluator.test(
+                        model_A, cv_calib,
+                        limit=cfg.calib_size,
+                        no_wandb=True,
+                        do_calc_layer_importance=True,
+                    )
+                    layer_ranking = get_layer_ranking(
+                        latent_evaluator.layer_importance_total, cfg
+                    )
+                    logging.info(f"Mode 2 AUTO layer_curve: ranking={list(layer_ranking)}")
+
+                    # Step 4b: Sweep layers_list size from 1 to all
+                    results = []
+                    for i in range(len(layer_ranking)):
+                        layers_list_i = list(layer_ranking[: i + 1])
+                        logging.info(f"Layer curve step {i+1}/{len(layer_ranking)}: layers_list={layers_list_i}")
+                        cv_i = CVCommunicator(
+                            model_A, model_B,
+                            cfg.layer_from, cfg.layer_to,
+                            layers_list=layers_list_i,
+                            top_layers=0.0,
+                            apply_attn_tracer=False,
+                            shift_back=cfg.shift_back,
+                        ).to(cfg.device)
+                        latent_evaluator.layer_importance_total = defaultdict(list)
+                        result = latent_evaluator.test(model_A, cv_i, limit=cfg.limit)
+                        results.append(result)
+                    logging.info(f"Mode 2 AUTO layer_curve results: {results}")
+                    if cfg.use_wandb:
+                        wandb.log({"latent_layer_curve_results": results})
+
+            else:
+                # ── Sub-mode: MANUAL selection (original behaviour) ─────
+                latent_layers_list = cfg.layers_list
+                logging.info(
+                    f"Mode 2 MANUAL (KVComm + LatentMAS): "
+                    f"layers_list={latent_layers_list}"
+                )
+
+                cv = CVCommunicator(
+                    model_A, model_B,
+                    cfg.layer_from, cfg.layer_to,
+                    layers_list=latent_layers_list,
+                    top_layers=0.0,
+                    apply_attn_tracer=False,
+                    shift_back=cfg.shift_back,
+                ).to(cfg.device)
+                latent_evaluator = LatentCommunicationEvaluator(
+                    evaluator=evaluator,
+                    tokenizer=tokenizer,
+                    use_wandb=cfg.use_wandb,
+                    max_input_length=cfg.max_input_length,
+                    latent_mas=latent_mas,
+                    cv=cv,
+                    latent_only=cfg.latent_only,
+                    response_log_path=response_log_path,
+                )
+
+                if not cfg.do_layer_curve:
+                    results = latent_evaluator.test(model_A, cv, limit=cfg.limit)
+                else:
+                    # Manual do_layer_curve: iterate prefix of layers_list by position
+                    results = []
+                    for i in range(len(latent_layers_list)):
+                        layers_list_i = latent_layers_list[: i + 1]
+                        logging.info(f"Layer curve step {i+1}/{len(latent_layers_list)}: layers_list={layers_list_i}")
+                        cv_i = CVCommunicator(
+                            model_A, model_B,
+                            cfg.layer_from, cfg.layer_to,
+                            layers_list=layers_list_i,
+                            top_layers=0.0,
+                            apply_attn_tracer=False,
+                            shift_back=cfg.shift_back,
+                        ).to(cfg.device)
+                        result = latent_evaluator.test(model_A, cv_i, limit=cfg.limit)
+                        results.append(result)
+                    logging.info(f"Mode 2 MANUAL layer_curve results: {results}")
+                    if cfg.use_wandb:
+                        wandb.log({"latent_layer_curve_results": results})
 
     # ── Finish ────────────────────────────────────────────────────────────
     if cfg.use_wandb:

@@ -260,15 +260,17 @@ def forward_shift_back_llama(
     inputs_embeds = model.get_input_embeddings()(input_ids)
     if past_key_values is None:
         past_key_values = DynamicCache()
-    
-    ##########
+
+    seq_len = inputs_embeds.shape[1]  # T_B (number of B's input tokens)
+
+    ##########  Full-cache path (selected layers: T+N tokens)  ##########
     past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
     cache_position = torch.arange(
-        past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+        past_seen_tokens, past_seen_tokens + seq_len, device=inputs_embeds.device
     )
-
     position_ids = cache_position.unsqueeze(0)
 
+    # attention_mask here is [1]*(past_seen_tokens + seq_len) — correct for full cache.
     causal_mask = create_causal_mask(
         config=model.model.config,
         input_embeds=inputs_embeds,
@@ -277,20 +279,33 @@ def forward_shift_back_llama(
         past_key_values=past_key_values,
         position_ids=position_ids,
     )
-    ##########
-    ##########
-    short_past_key_values, short_length = get_short_past_key_values(past_key_values)
-    past_seen_tokens = short_past_key_values.get_seq_length() if short_past_key_values is not None else 0
-    short_cache_position = torch.arange(
-        past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-    )
 
+    ##########  Short-cache path (non-selected layers: short_length=1 token)  ##########
+    short_past_key_values, short_length = get_short_past_key_values(past_key_values)
+    short_past_seen = short_past_key_values.get_seq_length() if short_past_key_values is not None else 0
+    short_cache_position = torch.arange(
+        short_past_seen, short_past_seen + seq_len, device=inputs_embeds.device
+    )
     short_position_ids = short_cache_position.unsqueeze(0)
+
+    # Build a short_attention_mask matching the short cache length.
+    # The full attention_mask is [1]*(T+N+T_B) but short cache only has short_length tokens.
+    # Passing the full mask to create_causal_mask with short_cache_position causes
+    # it to build a wrong causal mask for these layers.
+    # Fix: construct [1]*(short_length + T_B) so the mask matches the actual short cache.
+    if attention_mask is not None:
+        short_attention_mask = torch.ones(
+            (attention_mask.shape[0], short_past_seen + seq_len),
+            dtype=attention_mask.dtype,
+            device=attention_mask.device,
+        )
+    else:
+        short_attention_mask = None
 
     short_causal_mask = create_causal_mask(
         config=model.model.config,
         input_embeds=inputs_embeds,
-        attention_mask=attention_mask,
+        attention_mask=short_attention_mask,  # ← matched to short cache length
         cache_position=short_cache_position,
         past_key_values=short_past_key_values,
         position_ids=short_position_ids,
@@ -368,18 +383,18 @@ def forward_shift_back_qwen2(
     inputs_embeds = model.get_input_embeddings()(input_ids)
     if past_key_values is None:
         past_key_values = DynamicCache()
-    
-    ##########
+
+    seq_len = inputs_embeds.shape[1]  # T_B
+
+    ##########  Full-cache path (selected layers)  ##########
     past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
     cache_position = torch.arange(
-        past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+        past_seen_tokens, past_seen_tokens + seq_len, device=inputs_embeds.device
     )
-
     position_ids = cache_position.unsqueeze(0)
 
     # It may already have been prepared by e.g. `generate`
     if not isinstance(causal_mask_mapping := attention_mask, dict):
-        # Prepare mask arguments
         mask_kwargs = {
             "config": model.model.config,
             "input_embeds": inputs_embeds,
@@ -388,39 +403,45 @@ def forward_shift_back_qwen2(
             "past_key_values": past_key_values,
             "position_ids": position_ids,
         }
-        # Create the masks
         causal_mask_mapping = {
             "full_attention": create_causal_mask(**mask_kwargs),
         }
-        # The sliding window alternating layers are not always activated depending on the config
         if model.model.has_sliding_layers:
             causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
-    ##########
-    ##########
-    short_past_key_values, short_length = get_short_past_key_values(past_key_values)
-    past_seen_tokens = short_past_key_values.get_seq_length() if short_past_key_values is not None else 0
-    short_cache_position = torch.arange(
-        past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-    )
 
+    ##########  Short-cache path (non-selected layers: short_length tokens)  ##########
+    short_past_key_values, short_length = get_short_past_key_values(past_key_values)
+    short_past_seen = short_past_key_values.get_seq_length() if short_past_key_values is not None else 0
+    short_cache_position = torch.arange(
+        short_past_seen, short_past_seen + seq_len, device=inputs_embeds.device
+    )
     short_position_ids = short_cache_position.unsqueeze(0)
 
+    # Build short_attention_mask matched to short cache length.
+    # The full attention_mask is [1]*(T+N+T_B); passing it with short_cache_position
+    # causes create_causal_mask to produce a wrong mask. Fix: [1]*(short_length + T_B).
+    if attention_mask is not None and not isinstance(attention_mask, dict):
+        short_attention_mask = torch.ones(
+            (attention_mask.shape[0], short_past_seen + seq_len),
+            dtype=attention_mask.dtype,
+            device=attention_mask.device,
+        )
+    else:
+        short_attention_mask = attention_mask
+
     # It may already have been prepared by e.g. `generate`
-    if not isinstance(short_causal_mask_mapping := attention_mask, dict):
-        # Prepare mask arguments
+    if not isinstance(short_causal_mask_mapping := short_attention_mask, dict):
         mask_kwargs = {
             "config": model.model.config,
             "input_embeds": inputs_embeds,
-            "attention_mask": attention_mask,
+            "attention_mask": short_attention_mask,  # ← matched to short cache
             "cache_position": short_cache_position,
             "past_key_values": short_past_key_values,
             "position_ids": short_position_ids,
         }
-        # Create the masks
         short_causal_mask_mapping = {
             "full_attention": create_causal_mask(**mask_kwargs),
         }
-        # The sliding window alternating layers are not always activated depending on the config
         if model.model.has_sliding_layers:
             short_causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
     ##########

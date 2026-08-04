@@ -8,6 +8,10 @@ from .twowikimqa import TwoWikiMQAEvaluator
 from .tmath import TMathEvaluator
 from .repobench import RepoBenchEvaluator
 from .samsum import SAMSumEvaluator
+# LatentMAS tasks
+from .medqa import MedQAEvaluator
+from .mbppplus import MBPPPlusEvaluator
+from .aime2024 import AIME2024Evaluator
 
 def get_evaluator(test_task: str):
     if test_task == "countries":
@@ -36,6 +40,13 @@ def get_evaluator(test_task: str):
         return RepoBenchEvaluator()
     elif test_task == "samsum":
         return SAMSumEvaluator()
+    # ── LatentMAS tasks ──────────────────────────────────────────────────
+    elif test_task == "medqa":
+        return MedQAEvaluator()
+    elif test_task == "mbppplus":
+        return MBPPPlusEvaluator()
+    elif test_task == "aime2024":
+        return AIME2024Evaluator()
     else:
         raise ValueError(f"Unsupported task name: {test_task}")
 

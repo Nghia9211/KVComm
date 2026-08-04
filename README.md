@@ -29,8 +29,7 @@ Note: Requires `transformers==4.53.3` specifically.
 
 ### Baseline Test
 ```bash
-python com.py \
-    --test_task hotpotqa \
+python com.py --test_task hotpotqa \
     --do_test_baseline \
     --model_A meta-llama/Llama-3.1-8B-Instruct \
     --model_B meta-llama/Llama-3.1-8B-Instruct
@@ -47,12 +46,7 @@ python com.py \
 
 ### KVComm Communication
 ```bash
-python com.py \
-    --test_task hotpotqa \
-    --do_test \
-    --model_A meta-llama/Llama-3.1-8B-Instruct \
-    --model_B meta-llama/Llama-3.1-8B-Instruct \
-    --top_layers 0.3
+python com.py --test_task hotpotqa --do_test --model_A meta-llama/Llama-3.2-3B-Instruct --model_B meta-llama/Llama-3.2-3B-Instruct --top_layers 0.7
 ```
 
 ### Activation Communication
@@ -146,3 +140,179 @@ python com.py \
 ```
 
 This automatically identifies which layers are most important for communication and selects them for the main evaluation.
+
+---
+
+## LatentMAS Integration (`com_latent.py`)
+
+Extension of KVComm that integrates **LatentMAS** — a latent thinking mechanism where model A compresses its reasoning into latent KV tokens before passing them to model B.
+
+### Architecture Overview
+
+```
+                    Model A (Sender)
+                         │
+               [input tokens: prompt_A]
+                         │
+                    forward pass
+                         │
+                   last hidden state
+                         │
+               ┌─────────▼──────────┐
+               │  Latent Loop × N   │  (latent_steps)
+               │  realign → embed   │
+               │  → forward → h_new │
+               └─────────┬──────────┘
+                         │
+                   DynamicCache
+               [T_input + N_latent KV tokens]
+                         │
+          ┌──────────────▼──────────────────┐
+          │    Mode 1          Mode 2        │
+          │  (all layers)   (top-k layers)  │
+          │                  prepare_key_cache()
+          └──────────────┬──────────────────┘
+                         │
+                    Model B (Receiver)
+               [input tokens: prompt_B]
+                         │
+                    → response
+```
+
+### Running Modes
+
+#### Mode 0 — Baseline: B only, no context from A
+```bash
+python com_latent.py \
+    --model_A meta-llama/Llama-3.2-3B-Instruct \
+    --model_B meta-llama/Llama-3.2-3B-Instruct \
+    --test_task hotpotqa \
+    --do_test_baseline
+```
+
+#### Mode 0b — Skyline: A+B both see full context (upper bound)
+```bash
+python com_latent.py \
+    --model_A meta-llama/Llama-3.2-3B-Instruct \
+    --model_B meta-llama/Llama-3.2-3B-Instruct \
+    --test_task hotpotqa \
+    --do_test_skyline
+```
+
+#### Mode 1 — LatentMAS Standalone: latent thinking, all KV layers passed to B
+```bash
+python com_latent.py \
+    --model_A meta-llama/Llama-3.2-3B-Instruct \
+    --model_B meta-llama/Llama-3.2-3B-Instruct \
+    --test_task hotpotqa \
+    --do_test_latent \
+    --latent_steps 5 \
+    --shift_back
+```
+
+> A runs N latent thinking steps. Full KV cache (all 28 layers) is passed to B directly.
+
+#### Mode 2 — LatentMAS + KVComm: latent thinking + selective KV layer transfer
+```bash
+python com_latent.py \
+    --model_A meta-llama/Llama-3.2-3B-Instruct \
+    --model_B meta-llama/Llama-3.2-3B-Instruct \
+    --test_task hotpotqa \
+    --do_test_latent \
+    --latent_steps 5 \
+    --latent_kv_select \
+    --top_layers 0.7 \
+    --calib_size 5 \
+    --shift_back
+```
+
+> A runs N latent thinking steps. KV cache is filtered to only the most important layers (top 70% by attention importance) before passing to B.
+
+##### Mode 2 Sub-modes: Layer Selection Strategy
+
+**AUTO** — calibrate importance on N samples, pick top-k% layers:
+```bash
+    --latent_kv_select --top_layers 0.7 --calib_size 5
+```
+
+**MANUAL** — specify exact layer indices:
+```bash
+    --latent_kv_select --layers_list 8 10 12 13 15 19 20
+```
+
+**RANDOM** — random layer subset (ablation):
+```bash
+    --latent_kv_select --top_layers 0.7 --random_selection
+```
+
+#### Mode 3 — Regular KVComm (no latent, for comparison baseline)
+```bash
+python com_latent.py \
+    --model_A meta-llama/Llama-3.2-3B-Instruct \
+    --model_B meta-llama/Llama-3.2-3B-Instruct \
+    --test_task hotpotqa \
+    --do_test \
+    --top_layers 0.7 \
+    --calib_size 5 \
+    --shift_back
+```
+
+### LatentMAS Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--latent_steps` | int | `5` | Number of latent thinking iterations. Lower = less degeneration (recommended: 5–10) |
+| `--latent_space_realign` | flag | `False` | Apply realignment matrix W to project hidden states back to embedding space between steps |
+| `--latent_kv_select` | flag | `False` | Enable Mode 2: filter KV cache by layer importance before passing to B |
+| `--latent_only` | flag | `False` | ⚠️ Experimental: pass only the N latent KV tokens (discard input tokens). Causes RoPE mismatch — do not use |
+| `--calib_size` | int | `1` | Number of calibration samples for layer ranking. Use ≥5 for reliable rankings |
+| `--shift_back` | flag | `False` | Fix RoPE position mismatch for attention-sink-only layers. **Always enable with latent** |
+| `--top_layers` | float | `0.0` | Fraction of top-importance layers to keep (e.g., `0.7` = keep top 70%) |
+| `--layers_list` | int[] | `[-1]` | Manual layer list for MANUAL sub-mode |
+| `--random_selection` | flag | `False` | Random layer selection (ablation baseline) |
+
+### Comparison Table
+
+| Mode | Script flag | Latent | KV Select | Expected Score (hotpotqa) |
+|------|------------|--------|-----------|--------------------------|
+| Baseline (B only) | `--do_test_baseline` | ❌ | ❌ | ~0.30 |
+| Skyline (full context) | `--do_test_skyline` | ❌ | ❌ | ~0.65 |
+| KVComm (no latent) | `--do_test` | ❌ | ✅ | ~0.60 |
+| LatentMAS standalone | `--do_test_latent` | ✅ | ❌ | ~0.35 |
+| **LatentMAS + KVComm** | `--do_test_latent --latent_kv_select` | ✅ | ✅ | **TBD** |
+
+### Output Files
+
+Each run creates a timestamped snapshot directory under `snapshots/`:
+
+```
+snapshots/
+└── llama3.23binstruct-to-llama3.23binstruct_top0.7_lat5_realign_kvsel_MMDD_HHMM/
+    ├── log.log          # Run config, calibration results, final scores
+    └── responses.jsonl  # Per-sample: prompt_a, prompt_b, response, answer, result_so_far
+```
+
+`responses.jsonl` format (one JSON per line):
+```json
+{
+  "idx": 42,
+  "prompt_a": "...",
+  "prompt_b": "...",
+  "response": "...",
+  "answer": "...",
+  "result_so_far": 0.3571
+}
+```
+
+### Evaluation Metric
+
+HotpotQA uses **token-level F1** with a 0.5 threshold:
+
+```
+result = mean over all samples of f1_match(answer, response)
+
+f1_match = True  (score 1.0)  if word-overlap F1 > 0.5
+         = False (score 0.0)  otherwise
+```
+
+Words are lowercased, punctuation-stripped, and lemmatized before comparison.
