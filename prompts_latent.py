@@ -59,41 +59,37 @@ LATENT_SENDER_AIME_INSTRUCTION = (
 # These models don't have a dedicated thinking mode, so we ask them to explicitly
 # encode key information rather than "think deeply" (which has no effect).
 
+# NOTHINK variants (Llama-3 và các non-think models)
+# Dùng goal-directed style thay vì encoding-directive style.
+# Bỏ câu "Your internal representation..." vì nó khiến B echo lại thành "I have internalized..."
 LATENT_SENDER_MATH_INSTRUCTION_NOTHINK = (
-    "Carefully read and encode the following mathematical hint. "
-    "Extract all key facts, numbers, and relationships. "
-    "Your encoded representation will be used by another agent to solve a related problem."
+    "You are a reader agent. Read the following mathematical hint carefully "
+    "and reason about the key facts, numbers, and relationships it contains."
 )
 LATENT_SENDER_QA_INSTRUCTION_NOTHINK = (
-    "Carefully read and encode the following context passage. "
-    "Extract all key entities, facts, and relationships. "
-    "Your encoded representation will be used by another agent to answer a question about it."
+    "You are a reader agent. Read the following context passage carefully "
+    "and reason about the key information it contains."
 )
 LATENT_SENDER_CODE_INSTRUCTION_NOTHINK = (
-    "Carefully read and encode the following code context. "
-    "Identify key functions, variables, and logic patterns. "
-    "Your encoded representation will be used by another agent to complete the code."
+    "You are a reader agent. Read the following code context carefully "
+    "and reason about the key functions, variables, and logic it contains."
 )
 LATENT_SENDER_SUMMARIZE_INSTRUCTION_NOTHINK = (
-    "Carefully read and encode the following content. "
-    "Extract the main ideas and key information. "
-    "Your encoded representation will be used by another agent to summarize related content."
+    "You are a reader agent. Read the following content carefully "
+    "and reason about the main ideas and key information it contains."
 )
 # LatentMAS tasks (non-think variants)
 LATENT_SENDER_MEDQA_INSTRUCTION_NOTHINK = (
-    "Carefully read and encode the following medical question and its answer choices. "
-    "Identify key clinical facts, symptoms, and relationships between options. "
-    "Your encoded representation will be used by another agent to select the correct answer."
+    "You are a medical reader agent. Read the following medical question and answer choices carefully "
+    "and reason about the clinical scenario, key facts, and relationships between options."
 )
 LATENT_SENDER_CODE_GEN_INSTRUCTION_NOTHINK = (
-    "Carefully read and encode the following programming problem and test cases. "
-    "Identify the required function signature, input/output behavior, and constraints. "
-    "Your encoded representation will be used by another agent to generate the solution code."
+    "You are a reader agent. Read the following programming problem and test cases carefully "
+    "and reason about the required function behavior, input/output constraints, and algorithm."
 )
 LATENT_SENDER_AIME_INSTRUCTION_NOTHINK = (
-    "Carefully read and encode the following competition mathematics problem. "
-    "Extract all numerical constraints, relationships, and relevant mathematical concepts. "
-    "Your encoded representation will be used by another agent to compute the final answer."
+    "You are a reader agent. Read the following competition mathematics problem carefully "
+    "and reason about the numerical constraints, relationships, and mathematical concepts."
 )
 
 

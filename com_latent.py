@@ -80,7 +80,7 @@ class LatentAlignConfig:
 
     # ── KVComm: layer selection ────────────────────────────────────────────
     layer_from: int = 0
-    layer_to: int = 26
+    layer_to: int = -1  # -1 = all layers (auto-detect from model)
     layers_list: list[int] = field(default_factory=lambda: [-1])
     top_layers: float = 0.0
     calib_size: int = 1

@@ -22,12 +22,23 @@ COMMUNICATION_CODE_MSG_TEMPLATE_B = "Instruction: {instruction} Code Snippet: {c
 COMMUNICATION_SUMMARIZE_MSG_TEMPLATE_A = "Instruction: {instruction} Content part 1: {content_part_1}"
 COMMUNICATION_SUMMARIZE_MSG_TEMPLATE_B = "Instruction: {instruction} Content part 2: {content_part_2}"
 
-THINK_MODEL_LIST = ["deepseek-ai/DeepSeek-R1-Distill-Llama-8B"]
+THINK_MODEL_LIST = [
+    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+    "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
+    "suayptalha/DeepSeek-R1-Distill-Llama-3B",
+    "bespokelabs/Bespoke-Stratos-7B",
+    "Qwen/QwQ-32B-Preview",
+]
 
 def is_think_model(model):
+    model_name = getattr(model, "name", str(model)).lower()
     for think_model in THINK_MODEL_LIST:
-        if think_model.lower() == model.name.lower():
+        if think_model.lower() in model_name or model_name in think_model.lower():
             return True
+    if "r1-distill" in model_name or "stratos" in model_name or "qwq" in model_name:
+        return True
     return False
 
 def apply_chat_template(evaluator, tokenizer, msg, model, context=False):

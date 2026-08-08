@@ -53,12 +53,17 @@ class CVCommunicator(PreTrainedModel, GenerationMixin):
         else:
             raise ValueError(f"num_hidden_layers not found in {self.B.config}")
 
+
         if layers_list[0] != -1:
             self.layers_list = layers_list
         elif top_layers > 0:
             self.layers_list = list(range(0, self.A_num_layers)) # set all layers at first
         else:
-            self.layers_list = list(range(self.layer_from, self.layer_to + 1))
+            # layer_to=-1 means "all layers up to the last one"
+            effective_to = self.layer_to if self.layer_to >= 0 else (self.A_num_layers - 1)
+            self.layers_list = list(range(self.layer_from, effective_to + 1))
+
+
 
         self.layer_map = get_layer_map(self.A_num_layers, self.B_num_layers)
 

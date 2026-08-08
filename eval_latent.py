@@ -158,11 +158,19 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
             return_tensors="pt",
         ).to(model_A.device)
 
-        # For think-models: append <think> token so latent loop starts from thinking state.
+        # For think-models: append <think> token(s) so latent loop starts from thinking state.
         # For non-think models: no prefix added (Llama, etc. don't have <think>).
+        # Note: convert_tokens_to_ids returns None when <think> is not a single special
+        # token (e.g. Llama-based distills tokenize it as multiple pieces). In that case
+        # fall back to encode(), which handles both single- and multi-token representations.
         if is_think_model(model_A):
             think_token_id = self.tokenizer.convert_tokens_to_ids("<think>")
-            think_tensor = torch.tensor([[think_token_id]], device=model_A.device)
+            if think_token_id is None:
+                # <think> is not a single special token — encode as a token sequence
+                think_ids = self.tokenizer.encode("<think>", add_special_tokens=False)
+                think_tensor = torch.tensor([think_ids], device=model_A.device)
+            else:
+                think_tensor = torch.tensor([[think_token_id]], device=model_A.device)
             input_ids_A = torch.cat([input_ids_A, think_tensor], dim=-1)
 
         # ── Receiver B: latent-aware prompt ──────────────────────────────

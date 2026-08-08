@@ -30,12 +30,23 @@ SENDER_QA_INSTRUCTION = "Summarize the context passage in a concise way, as it w
 SENDER_MATH_INSTRUCTION = "Summarize the hint in a concise way, as it will be used by another agent to answer the question."
 SENDER_CODE_INSTRUCTION = "Summarize the code snippet in a concise way, as it will be used by another agent to complete the code."
 
-THINK_MODEL_LIST = ["deepseek-ai/DeepSeek-R1-Distill-Llama-8B"]
+THINK_MODEL_LIST = [
+    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+    "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
+    "suayptalha/DeepSeek-R1-Distill-Llama-3B",
+    "bespokelabs/Bespoke-Stratos-7B",
+    "Qwen/QwQ-32B-Preview",
+]
 
 def is_think_model(model):
+    model_name = getattr(model, "name", str(model)).lower()
     for think_model in THINK_MODEL_LIST:
-        if think_model.lower() == model.name.lower():
+        if think_model.lower() in model_name or model_name in think_model.lower():
             return True
+    if "r1-distill" in model_name or "stratos" in model_name or "qwq" in model_name:
+        return True
     return False
 
 def apply_chat_template(evaluator, tokenizer, msg, model, context=False):
