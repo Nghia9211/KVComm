@@ -7,9 +7,10 @@ from transformers.generation.utils import GenerationMixin
 from transformers.cache_utils import DynamicCache, Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast
 import logging
-from model_attn import LlamaAttentionTracer, Qwen2AttentionTracer, Gemma3AttentionTracer
+from model_attn import LlamaAttentionTracer, Qwen2AttentionTracer, Qwen3AttentionTracer, Gemma3AttentionTracer
 from transformers.models.llama.modeling_llama import LlamaAttention, LlamaModel, repeat_kv
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, Qwen2Model
+from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention, Qwen3Model
 from transformers.models.gemma3.modeling_gemma3 import Gemma3Attention
 
 def get_layer_map(L_A, L_B):
@@ -86,6 +87,10 @@ class CVCommunicator(PreTrainedModel, GenerationMixin):
                 new = Qwen2AttentionTracer(old.config, old.layer_idx).to(device, dtype)
                 new.load_state_dict(old.state_dict(), strict=True)
                 block.self_attn = new
+            elif type(old) is Qwen3Attention:
+                new = Qwen3AttentionTracer(old.config, old.layer_idx).to(device, dtype)
+                new.load_state_dict(old.state_dict(), strict=True)
+                block.self_attn = new
             elif type(old) is LlamaAttention:
                 new = LlamaAttentionTracer(old.config, old.layer_idx).to(device, dtype)
                 new.load_state_dict(old.state_dict(), strict=True)
@@ -97,19 +102,33 @@ class CVCommunicator(PreTrainedModel, GenerationMixin):
             else:
                 raise ValueError(f"Unsupported attention module: {type(old)}")
 
+    def get_layer_device(self, layer_idx: int):
+        try:
+            if hasattr(self.B, "model") and hasattr(self.B.model, "layers"):
+                return self.B.model.layers[layer_idx].self_attn.k_proj.weight.device
+            elif hasattr(self.B, "model") and hasattr(self.B.model, "language_model"):
+                return self.B.model.language_model.layers[layer_idx].self_attn.k_proj.weight.device
+        except Exception:
+            pass
+        return next(self.B.parameters()).device
+
     def prepare_key_cache(self, past_key_values):
         key_cache = past_key_values.key_cache
         value_cache = past_key_values.value_cache
         assert len(key_cache) == len(self.layer_map), "key_cache and layer_map must have the same length"
         past_key_values_new = DynamicCache()
         for i in range(len(key_cache)): # i is the layer index of model A
+            target_layer_b = self.layer_map[i]
+            target_device = self.get_layer_device(target_layer_b)
+            k_i = key_cache[i].to(target_device)
+            v_i = value_cache[i].to(target_device)
             if i in self.layers_list or i == 0:
-                past_key_values_new.update(key_cache[i], value_cache[i], self.layer_map[i])
+                past_key_values_new.update(k_i, v_i, target_layer_b)
             else:
                 # keep the first token due to attention sink
-                key_cache_i = key_cache[i][:, :, :1, :]
-                value_cache_i = value_cache[i][:, :, :1, :]
-                past_key_values_new.update(key_cache_i, value_cache_i, self.layer_map[i])
+                key_cache_i = k_i[:, :, :1, :]
+                value_cache_i = v_i[:, :, :1, :]
+                past_key_values_new.update(key_cache_i, value_cache_i, target_layer_b)
         return past_key_values_new
 
     def forward(
@@ -138,7 +157,7 @@ class CVCommunicator(PreTrainedModel, GenerationMixin):
                     past_key_values=out_A_past_key_values,
                     **kwargs
                 )
-            elif type(self.B.model) == Qwen2Model:
+            elif type(self.B.model) in (Qwen2Model, Qwen3Model):
                 out_B = forward_shift_back_qwen2(
                     model=self.B,
                     input_ids=input_ids,

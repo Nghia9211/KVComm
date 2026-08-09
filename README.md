@@ -257,10 +257,20 @@ python com_latent.py \
     --shift_back
 ```
 
+
+
+### Runinng Thinking Model :
+```bash
+python com_latent.py --model_A suayptalha/DeepSeek-R1-Distill-Llama-3B --model_B suayptalha/DeepSeek-R1-Distill-Llama-3B --latent_steps 1 --do_test_latent --test_task tmath --device cuda:0 --device_B cuda:1    
+```
+  
+
 ### LatentMAS Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
+| `--device` | str | `"cuda:0"` | Primary GPU device (or device for `model_A`). Supports `"cuda:0"`, `"auto"`, etc. |
+| `--device_B` | str | `""` | Device for `model_B`. If empty, defaults to `--device`. Supports multi-GPU (e.g. `--device cuda:0 --device_B cuda:1`) |
 | `--latent_steps` | int | `5` | Number of latent thinking iterations. Lower = less degeneration (recommended: 5–10) |
 | `--latent_space_realign` | flag | `False` | Apply realignment matrix W to project hidden states back to embedding space between steps |
 | `--latent_kv_select` | flag | `False` | Enable Mode 2: filter KV cache by layer importance before passing to B |

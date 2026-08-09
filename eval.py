@@ -46,6 +46,10 @@ THINK_MODEL_LIST = [
     "suayptalha/DeepSeek-R1-Distill-Llama-3B",
     "bespokelabs/Bespoke-Stratos-7B",
     "Qwen/QwQ-32B-Preview",
+    "Qwen/Qwen3-4B",
+    "Qwen/Qwen3-8B",
+    "Qwen/Qwen3-1.7B",
+    "Qwen/Qwen3-0.6B",
 ]
 
 def is_think_model(model):
@@ -53,7 +57,7 @@ def is_think_model(model):
     for think_model in THINK_MODEL_LIST:
         if think_model.lower() in model_name or model_name in think_model.lower():
             return True
-    if "r1-distill" in model_name or "stratos" in model_name or "qwq" in model_name:
+    if "r1-distill" in model_name or "stratos" in model_name or "qwq" in model_name or "qwen3" in model_name:
         return True
     return False
 

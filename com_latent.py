@@ -70,6 +70,7 @@ from layer_importance import get_top_layers, get_layer_ranking
 class LatentAlignConfig:
     # ── Device ────────────────────────────────────────────────────────────
     device: str = "cuda:0"
+    device_B: str = ""
     seed: int = 42
     snapshot_path: str = "snapshots"
 
@@ -180,15 +181,23 @@ def main(cfg: LatentAlignConfig):
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    device_A = cfg.device
+    device_B = cfg.device_B if cfg.device_B else cfg.device
+
+    def parse_device_map(d_str: str):
+        if d_str.lower() == "auto":
+            return "auto"
+        return {"": d_str}
+
     model_A = AutoModelForCausalLM.from_pretrained(
         cfg.model_A,
-        device_map={"": cfg.device},
+        device_map=parse_device_map(device_A),
         torch_dtype=torch.bfloat16,
         attn_implementation="sdpa",
     )
     model_B = AutoModelForCausalLM.from_pretrained(
         cfg.model_B,
-        device_map={"": cfg.device},
+        device_map=parse_device_map(device_B),
         torch_dtype=torch.bfloat16,
         attn_implementation="sdpa",
     )
@@ -240,7 +249,7 @@ def main(cfg: LatentAlignConfig):
             top_layers=cfg.top_layers,
             apply_attn_tracer=False,
             shift_back=cfg.shift_back,
-        ).to(cfg.device)
+        )
         results = comm_evaluator.test(model_A, cv, limit=cfg.limit)
 
     # ── LatentMAS + KVComm (main new method) ──────────────────────────────
@@ -288,7 +297,7 @@ def main(cfg: LatentAlignConfig):
                 top_layers=0.0,
                 apply_attn_tracer=False,
                 shift_back=cfg.shift_back,
-            ).to(cfg.device)
+            )
             latent_evaluator = LatentCommunicationEvaluator(
                 evaluator=evaluator,
                 tokenizer=tokenizer,
@@ -319,7 +328,7 @@ def main(cfg: LatentAlignConfig):
                     top_layers=0.0,
                     apply_attn_tracer=False,
                     shift_back=cfg.shift_back,
-                ).to(cfg.device)
+                )
                 latent_evaluator = LatentCommunicationEvaluator(
                     evaluator=evaluator,
                     tokenizer=tokenizer,
@@ -353,7 +362,7 @@ def main(cfg: LatentAlignConfig):
                     top_layers=0.0,
                     apply_attn_tracer=True,
                     shift_back=cfg.shift_back,
-                ).to(cfg.device)
+                )
 
                 # Step 2: Build latent evaluator using cv_calib for assertion check
                 latent_evaluator = LatentCommunicationEvaluator(
@@ -388,7 +397,7 @@ def main(cfg: LatentAlignConfig):
                         top_layers=0.0,
                         apply_attn_tracer=False,
                         shift_back=cfg.shift_back,
-                    ).to(cfg.device)
+                    )
 
                     # Step 6a: Reset layer importance and run actual evaluation
                     latent_evaluator.layer_importance_total = defaultdict(list)
@@ -419,7 +428,7 @@ def main(cfg: LatentAlignConfig):
                             top_layers=0.0,
                             apply_attn_tracer=False,
                             shift_back=cfg.shift_back,
-                        ).to(cfg.device)
+                        )
                         latent_evaluator.layer_importance_total = defaultdict(list)
                         result = latent_evaluator.test(model_A, cv_i, limit=cfg.limit)
                         results.append(result)
@@ -442,7 +451,7 @@ def main(cfg: LatentAlignConfig):
                     top_layers=0.0,
                     apply_attn_tracer=False,
                     shift_back=cfg.shift_back,
-                ).to(cfg.device)
+                )
                 latent_evaluator = LatentCommunicationEvaluator(
                     evaluator=evaluator,
                     tokenizer=tokenizer,
@@ -469,7 +478,7 @@ def main(cfg: LatentAlignConfig):
                             top_layers=0.0,
                             apply_attn_tracer=False,
                             shift_back=cfg.shift_back,
-                        ).to(cfg.device)
+                        )
                         result = latent_evaluator.test(model_A, cv_i, limit=cfg.limit)
                         results.append(result)
                     logging.info(f"Mode 2 MANUAL layer_curve results: {results}")

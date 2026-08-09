@@ -1,10 +1,9 @@
-import os
-import glob
-import re
-from typing import Dict, Any
+from .base_evaluator import BaseEvaluator
 from datasets import load_dataset
 from rouge import Rouge
-from .base_evaluator import BaseEvaluator
+import os
+import glob
+from typing import Dict, Any
 
 
 class TMathEvaluator(BaseEvaluator):
@@ -35,69 +34,20 @@ class TMathEvaluator(BaseEvaluator):
         dataset = dataset.rename_column("solution", "answer")
         return dataset
 
-    @staticmethod
-    def _extract_boxed(text: str) -> str:
-        """Trích xuất nội dung \boxed{...} cuối cùng trong văn bản, hỗ trợ cả ngoặc nhọn lồng nhau."""
-        results = []
-        for m in re.finditer(r'\\boxed\{', text):
-            start = m.end()
-            depth = 1
-            i = start
-            while i < len(text) and depth > 0:
-                if text[i] == '{':
-                    depth += 1
-                elif text[i] == '}':
-                    depth -= 1
-                i += 1
-            if depth == 0:
-                results.append(text[start:i - 1])
-        return results[-1].strip() if results else ""
-
-    @staticmethod
-    def _normalize(s: str) -> str:
-        """Chuẩn hóa chuỗi toán học để so sánh."""
-        s = s.replace("\\,", "").replace("\\!", "").replace("\\ ", "")
-        s = re.sub(r'\s+', '', s)
-        s = s.replace("dfrac", "frac").replace("tfrac", "frac")
-        s = s.lower()
-        return s
-
     def evaluate_item(self, item: Dict[str, Any], response: str):
         if self.multiple_answers:
             answers = item['answers']
         else:
             answers = [item['answer']]
-
-        score = 0.0
+        rouge_score = 0
         for answer in answers:
-            # 1. Trích xuất đáp án chuẩn trong \boxed{} từ bài giải mẫu
-            gold_boxed = self._extract_boxed(answer)
-
-            if gold_boxed:
-                gold_norm = self._normalize(gold_boxed)
-                resp_boxed = self._extract_boxed(response)
-                
-                # 2. Nếu model có trả về \boxed{...}, so sánh trực tiếp
-                if resp_boxed:
-                    if self._normalize(resp_boxed) == gold_norm:
-                        score = 1.0
-                        break
-                
-                # 3. Fallback: Kiểm tra xem đáp án chuẩn có xuất hiện trong response hay không
-                if gold_norm in self._normalize(response):
-                    score = 1.0
-                    break
-            else:
-                # Nếu bài giải mẫu không chứa \boxed{}, fallback về ROUGE-L như cũ
-                try:
-                    scores = self.rouge.get_scores(response, answer)[0]
-                    score = max(score, scores["rouge-l"]["f"])
-                except Exception:
-                    continue
-
-        self.f1_total += score
+            try:
+                scores = self.rouge.get_scores(response, answer)[0]
+            except:
+                continue
+            rouge_score = max(rouge_score, scores["rouge-l"]["r"])
+        self.f1_total += rouge_score
         self.f1_count += 1
-
 
 
 
