@@ -86,7 +86,9 @@ class MedQAEvaluator(BaseEvaluator):
 
     def __init__(self, n_samples: int = None):
         super().__init__()
-        self.max_tokens = 512        # MCQ: answer is short, but reasoning helps
+        self.max_tokens = 256        # MCQ: \boxed{X} + brief reasoning, 256 is sufficient.
+                                     # 512 causes B to over-generate when KV context is
+                                     # truncated (KV Select mode), inflating inference time 2x.
         self.truncate_input = True
         self.multiple_answers = False
         self.n_samples = n_samples   # None = use all samples

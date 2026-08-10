@@ -95,6 +95,9 @@ def generate_run_name(cfg) -> str:
     method = get_method_name(cfg)
     base_name += f"_{method}"
 
+    if getattr(cfg, "test_task", ""):
+        base_name = f"{cfg.test_task}_{base_name}"
+
     return base_name
 
 
@@ -116,5 +119,8 @@ def generate_run_name_multi_agent(cfg) -> str:
 
     method = get_method_name(cfg)
     base_name += f"_{method}"
+
+    if getattr(cfg, "test_task", ""):
+        base_name = f"{cfg.test_task}_{base_name}"
 
     return base_name

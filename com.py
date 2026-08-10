@@ -72,7 +72,12 @@ def main(cfg: AlignConfig):
     os.makedirs(cfg.snapshot_path, exist_ok=True)
 
     timestamp = datetime.datetime.now().strftime("%m%d_%H%M")
-    run_name = generate_run_name(cfg) if cfg.run_name == "" else cfg.run_name
+    if cfg.run_name == "":
+        run_name = generate_run_name(cfg)
+    else:
+        run_name = cfg.run_name
+        if getattr(cfg, "test_task", "") and not run_name.startswith(f"{cfg.test_task}_"):
+            run_name = f"{cfg.test_task}_{run_name}"
     run_name = f"{run_name}_{timestamp}"
 
     final_snapshot_path = os.path.join(cfg.snapshot_path, run_name)
