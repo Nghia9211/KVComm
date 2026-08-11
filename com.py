@@ -21,6 +21,7 @@ import random
 class AlignConfig:
     # device configuration
     device: str = "cuda:0"
+    device_B: str = ""
     seed: int = 42
     snapshot_path: str = "snapshots"
     # model configuration
@@ -114,8 +115,16 @@ def main(cfg: AlignConfig):
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model_A = AutoModelForCausalLM.from_pretrained(cfg.model_A, device_map={"": cfg.device}, torch_dtype=torch.bfloat16, attn_implementation="sdpa")
-    model_B = AutoModelForCausalLM.from_pretrained(cfg.model_B, device_map={"": cfg.device}, torch_dtype=torch.bfloat16, attn_implementation="sdpa")
+    device_A = cfg.device
+    device_B = cfg.device_B if cfg.device_B else cfg.device
+
+    def parse_device_map(d_str: str):
+        if d_str.lower() == "auto":
+            return "auto"
+        return {"": d_str}
+
+    model_A = AutoModelForCausalLM.from_pretrained(cfg.model_A, device_map=parse_device_map(device_A), torch_dtype=torch.bfloat16, attn_implementation="sdpa")
+    model_B = AutoModelForCausalLM.from_pretrained(cfg.model_B, device_map=parse_device_map(device_B), torch_dtype=torch.bfloat16, attn_implementation="sdpa")
     model_A.eval()
     model_B.eval()
 
@@ -141,7 +150,7 @@ def main(cfg: AlignConfig):
     if cfg.do_test:
         communication_evaluator = CommunicationEvaluator(evaluator, tokenizer, cfg.use_wandb, cfg.max_input_length)
         if cfg.top_layers > 0:
-            cv = CVCommunicator(model_A, model_B, cfg.layer_from, cfg.layer_to, layers_list=cfg.layers_list, top_layers=cfg.top_layers, apply_attn_tracer=True, shift_back=False).to(cfg.device)
+            cv = CVCommunicator(model_A, model_B, cfg.layer_from, cfg.layer_to, layers_list=cfg.layers_list, top_layers=cfg.top_layers, apply_attn_tracer=True, shift_back=False)
             if cfg.random_selection:
                 cfg.layers_list = random.sample(list(range(0, cv.A_num_layers)), int(cfg.top_layers * cv.A_num_layers))
                 logging.info(f"Randomly selected layers list: {cfg.layers_list}")
@@ -149,25 +158,25 @@ def main(cfg: AlignConfig):
                 communication_evaluator.test(model_A, cv, limit=cfg.calib_size, no_wandb=True, do_calc_layer_importance=True)
                 cfg = get_top_layers(communication_evaluator.layer_importance_total, cfg)
         elif cfg.do_layer_curve:
-            cv = CVCommunicator(model_A, model_B, cfg.layer_from, cfg.layer_to, layers_list=cfg.layers_list, top_layers=cfg.top_layers, apply_attn_tracer=True, shift_back=False).to(cfg.device)
+            cv = CVCommunicator(model_A, model_B, cfg.layer_from, cfg.layer_to, layers_list=cfg.layers_list, top_layers=cfg.top_layers, apply_attn_tracer=True, shift_back=False)
             communication_evaluator.test(model_A, cv, limit=cfg.calib_size, no_wandb=True, do_calc_layer_importance=True)
             layer_ranking = get_layer_ranking(communication_evaluator.layer_importance_total, cfg)
         if not cfg.do_layer_curve:
-            cv = CVCommunicator(model_A, model_B, cfg.layer_from, cfg.layer_to, layers_list=cfg.layers_list, top_layers=cfg.top_layers, apply_attn_tracer=False, shift_back=cfg.shift_back).to(cfg.device)
+            cv = CVCommunicator(model_A, model_B, cfg.layer_from, cfg.layer_to, layers_list=cfg.layers_list, top_layers=cfg.top_layers, apply_attn_tracer=False, shift_back=cfg.shift_back)
             results = communication_evaluator.test(model_A, cv, limit=cfg.limit)
         else:
             results = []
             for i in range(len(layer_ranking)):
                 layers_list = layer_ranking[:i+1]
                 logging.info(f"Evaluating with layers_list: {layers_list}")
-                cv = CVCommunicator(model_A, model_B, cfg.layer_from, cfg.layer_to, layers_list=layers_list, top_layers=cfg.top_layers, apply_attn_tracer=False, shift_back=cfg.shift_back).to(cfg.device)
+                cv = CVCommunicator(model_A, model_B, cfg.layer_from, cfg.layer_to, layers_list=layers_list, top_layers=cfg.top_layers, apply_attn_tracer=False, shift_back=cfg.shift_back)
                 result = communication_evaluator.test(model_A, cv, limit=cfg.limit)
                 results.append(result)
             logging.info(f"Layer curve results: {results}")
             if cfg.use_wandb:
                 wandb.log({f"layer_curve_results": results})
     if cfg.do_test_ac:
-        ac = ActivationCommunicator(model_A, model_B, cfg.layer_k, cfg.layer_j, f=cfg.f).to(cfg.device)
+        ac = ActivationCommunicator(model_A, model_B, cfg.layer_k, cfg.layer_j, f=cfg.f)
         ac_evaluator = ACEvaluator(evaluator, tokenizer, cfg.use_wandb, cfg.max_input_length)
         results = ac_evaluator.test(model_A, ac, limit=cfg.limit)
     if cfg.do_test_nld:
