@@ -22,9 +22,17 @@ Extends CommunicationEvaluator with the following changes vs KVComm original:
          So no CLI flag is needed to set max_tokens per task.
 
   3. Supported LatentMAS tasks (via dataloader flags):
-       evaluator.medqa     → MedQAEvaluator    (MCQ, \\boxed{A/B/C/D})
-       evaluator.mbppplus  → MBPPPlusEvaluator (code, ```python...```, execute)
-       evaluator.aime      → AIME2024Evaluator (math, \\boxed{N})
+       # MCQ tasks
+       evaluator.medqa        → MedQAEvaluator      (MCQ medical, \\boxed{A/B/C/D})
+       evaluator.arc_easy     → ARCEasyEvaluator     (MCQ science easy, \\boxed{A/B/C/D})
+       evaluator.arc_challenge→ ARCChallengeEvaluator(MCQ science hard, \\boxed{A/B/C/D})
+       evaluator.gpqa         → GPQAEvaluator        (MCQ graduate sci, \\boxed{A/B/C/D})
+       # Math tasks
+       evaluator.aime         → AIME2024/2025Evaluator (competition math, \\boxed{N})
+       evaluator.gsm8k        → GSM8KEvaluator        (math word problem, \\boxed{N})
+       # Code tasks
+       evaluator.mbppplus     → MBPPPlusEvaluator    (code gen, ```python...```, execute)
+       evaluator.humanevalplus→ HumanEvalPlusEvaluator(code gen, ```python...```, execute)
 
 Layer importance tracking, _test, test are inherited from parent unchanged.
 """

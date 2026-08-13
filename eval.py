@@ -38,6 +38,59 @@ SENDER_MATH_INSTRUCTION = "Summarize the hint in a concise way, as it will be us
 SENDER_CODE_INSTRUCTION = "Summarize the code snippet in a concise way, as it will be used by another agent to complete the code."
 SENDER_SUMMARIZE_INSTRUCTION = "Summarize the content in a concise way, as it will be used by another agent to understand the content."
 
+# ── LatentMAS task instructions ──────────────────────────────────────────────
+# NOTE: These tasks have prompt_A == prompt_B (full question/problem for both A and B).
+
+# Solver B instructions — used in Skyline, Baseline, Communication-B, NLD-B
+MCQ_INSTRUCTION      = "Reason step-by-step and select the correct answer (A, B, C, D)."
+AIME_INSTRUCTION     = "Solve this competition math problem step-by-step."
+GSM8K_INSTRUCTION    = "Solve this math word problem step-by-step."
+CODE_GEN_INSTRUCTION = "Write a correct, self-contained Python solution."
+
+# Reader A instructions — used in CommunicationEvaluator Sender A
+READER_MCQ_INSTRUCTION      = "Read and analyze the following question and answer options."
+READER_AIME_INSTRUCTION     = "Read and analyze the following competition math problem."
+READER_GSM8K_INSTRUCTION    = "Read and analyze the following math word problem."
+READER_CODE_GEN_INSTRUCTION = "Read and analyze the following programming problem."
+
+# NLD Sender A instructions (sender_aware mode) — summarize-style
+SENDER_MCQ_INSTRUCTION      = "Summarize the key reasoning for this question to help another agent select the correct answer."
+SENDER_AIME_INSTRUCTION     = "Summarize the key insights of this problem to help another agent solve it."
+SENDER_GSM8K_INSTRUCTION    = "Summarize the key information in this problem to help another agent solve it."
+SENDER_CODE_GEN_INSTRUCTION = "Summarize the requirements of this problem to help another agent implement the solution."
+
+# ── LatentMAS message templates ──────────────────────────────────────────────
+# Single-field templates (Skyline / Comm-A / NLD-A)
+# prompt_A == prompt_B for LatentMAS tasks so we use a single content field.
+LATENTMAS_MCQ_MSG_TEMPLATE      = "Instruction: {instruction} Question: {question}"
+LATENTMAS_MATH_MSG_TEMPLATE     = "Instruction: {instruction} Problem: {problem}"
+LATENTMAS_CODE_GEN_MSG_TEMPLATE = "Instruction: {instruction} Problem: {problem}"
+
+# Receiver B / Baseline templates — include answer format guidance
+LATENTMAS_MCQ_MSG_TEMPLATE_B = (
+    "Instruction: {instruction} Question: {question}\n"
+    "Your final answer must be selected from A, B, C, D. "
+    "For example \\boxed{{A}}. Do not add any other content inside the box.\n"
+    "Now, reason step by step and output the final answer inside \\boxed{{YOUR_FINAL_ANSWER}}."
+)
+LATENTMAS_AIME_MSG_TEMPLATE_B = (
+    "Instruction: {instruction} Problem: {problem}\n"
+    "Reason step by step and output the final answer inside \\boxed{{YOUR_FINAL_ANSWER}}.\n"
+    "Now, reason step by step and output the final answer inside \\boxed{{YOUR_FINAL_ANSWER}}."
+)
+LATENTMAS_GSM8K_MSG_TEMPLATE_B = (
+    "Instruction: {instruction} Problem: {problem}\n"
+    "Reason step by step and output the final answer inside \\boxed{{YOUR_FINAL_ANSWER}}.\n"
+    "Now, reason step by step and output the final answer inside \\boxed{{YOUR_FINAL_ANSWER}}."
+)
+LATENTMAS_CODE_GEN_MSG_TEMPLATE_B = (
+    "Instruction: {instruction} Problem: {problem}\n"
+    "Put all your Python code inside a markdown code block:\n"
+    "```python\nYOUR_CODE_HERE\n```\n"
+    "Do not add any other content inside the code block.\n"
+    "Now, reason step by step and output the final answer inside ```python\nYOUR_PYTHON_CODE\n```."
+)
+
 THINK_MODEL_LIST = [
     "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
     "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
@@ -111,12 +164,23 @@ class SkylineEvaluator:
         return input_ids
 
     def prepare_input_ids(self, item, model):
+        # ── KVComm original tasks (prompt_A != prompt_B) ──────────────────────
         if hasattr(self.evaluator, "tmath"):
             msg = SKTLINE_MATH_MSG_TEMPLATE.format(instruction=MATH_INSTRUCTION, hint=item["prompt_A"], question=item["prompt_B"])
         elif hasattr(self.evaluator, "repobench"):
             msg = SKTLINE_CODE_MSG_TEMPLATE.format(instruction=CODE_INSTRUCTION, context=item["prompt_A"], code_snippet=item["prompt_B"])
         elif hasattr(self.evaluator, "sasum"):
             msg = SKTLINE_SUMMARIZE_MSG_TEMPLATE.format(instruction=SUMMARIZE_INSTRUCTION, content_part_1=item["prompt_A"], content_part_2=item["prompt_B"])
+        # ── LatentMAS tasks (prompt_A == prompt_B; use only prompt_B) ──────────
+        elif hasattr(self.evaluator, "medqa") or hasattr(self.evaluator, "arc_easy") or hasattr(self.evaluator, "arc_challenge") or hasattr(self.evaluator, "gpqa"):
+            msg = LATENTMAS_MCQ_MSG_TEMPLATE_B.format(instruction=MCQ_INSTRUCTION, question=item["prompt_B"])
+        elif hasattr(self.evaluator, "aime"):
+            msg = LATENTMAS_AIME_MSG_TEMPLATE_B.format(instruction=AIME_INSTRUCTION, problem=item["prompt_B"])
+        elif hasattr(self.evaluator, "gsm8k"):
+            msg = LATENTMAS_GSM8K_MSG_TEMPLATE_B.format(instruction=GSM8K_INSTRUCTION, problem=item["prompt_B"])
+        elif hasattr(self.evaluator, "mbppplus") or hasattr(self.evaluator, "humanevalplus"):
+            msg = LATENTMAS_CODE_GEN_MSG_TEMPLATE_B.format(instruction=CODE_GEN_INSTRUCTION, problem=item["prompt_B"])
+        # ── Default: QA ────────────────────────────────────────────────────────
         else:
             msg = SKTLINE_QA_MSG_TEMPLATE.format(instruction=QA_INSTRUCTION, context=item["prompt_A"], question=item["prompt_B"])
         input_ids = apply_chat_template(self.evaluator, self.tokenizer, msg, model)
@@ -183,12 +247,23 @@ class BaselineEvaluator(SkylineEvaluator):
         self.name = "baseline"
         
     def prepare_input_ids(self, item, model):
+        # ── KVComm original tasks ──────────────────────────────────────────────
         if hasattr(self.evaluator, "tmath"):
             msg = BASELINE_MATH_MSG_TEMPLATE.format(instruction=MATH_INSTRUCTION, question=item["prompt_B"])
         elif hasattr(self.evaluator, "repobench"):
             msg = BASELINE_CODE_MSG_TEMPLATE.format(instruction=CODE_INSTRUCTION, code_snippet=item["prompt_B"])
         elif hasattr(self.evaluator, "sasum"):
             msg = BASELINE_SUMMARIZE_MSG_TEMPLATE.format(instruction=SUMMARIZE_INSTRUCTION, content_part_2=item["prompt_B"])
+        # ── LatentMAS tasks (B only, no context from A; include answer format) ──
+        elif hasattr(self.evaluator, "medqa") or hasattr(self.evaluator, "arc_easy") or hasattr(self.evaluator, "arc_challenge") or hasattr(self.evaluator, "gpqa"):
+            msg = LATENTMAS_MCQ_MSG_TEMPLATE_B.format(instruction=MCQ_INSTRUCTION, question=item["prompt_B"])
+        elif hasattr(self.evaluator, "aime"):
+            msg = LATENTMAS_AIME_MSG_TEMPLATE_B.format(instruction=AIME_INSTRUCTION, problem=item["prompt_B"])
+        elif hasattr(self.evaluator, "gsm8k"):
+            msg = LATENTMAS_GSM8K_MSG_TEMPLATE_B.format(instruction=GSM8K_INSTRUCTION, problem=item["prompt_B"])
+        elif hasattr(self.evaluator, "mbppplus") or hasattr(self.evaluator, "humanevalplus"):
+            msg = LATENTMAS_CODE_GEN_MSG_TEMPLATE_B.format(instruction=CODE_GEN_INSTRUCTION, problem=item["prompt_B"])
+        # ── Default: QA ────────────────────────────────────────────────────────
         else:
             msg = BASELINE_QA_MSG_TEMPLATE.format(instruction=QA_INSTRUCTION, question=item["prompt_B"])
         input_ids = apply_chat_template(self.evaluator, self.tokenizer, msg, model)
@@ -212,22 +287,44 @@ class CommunicationEvaluator(SkylineEvaluator):
         return input_ids_A, input_ids_B
 
     def prepare_input_ids(self, item, model_A, model_B):
+        # ── Sender A ──────────────────────────────────────────────────────────
+        # KVComm original tasks (prompt_A != prompt_B)
         if hasattr(self.evaluator, "tmath"):
             msg_A = COMMUNICATION_MATH_MSG_TEMPLATE_A.format(instruction=MATH_INSTRUCTION, hint=item["prompt_A"])
         elif hasattr(self.evaluator, "repobench"):
             msg_A = COMMUNICATION_CODE_MSG_TEMPLATE_A.format(instruction=CODE_INSTRUCTION, context=item["prompt_A"])
         elif hasattr(self.evaluator, "sasum"):
             msg_A = COMMUNICATION_SUMMARIZE_MSG_TEMPLATE_A.format(instruction=SUMMARIZE_INSTRUCTION, content_part_1=item["prompt_A"])
+        # LatentMAS tasks: A reads/encodes the full question (prompt_A == prompt_B)
+        elif hasattr(self.evaluator, "medqa") or hasattr(self.evaluator, "arc_easy") or hasattr(self.evaluator, "arc_challenge") or hasattr(self.evaluator, "gpqa"):
+            msg_A = LATENTMAS_MCQ_MSG_TEMPLATE.format(instruction=READER_MCQ_INSTRUCTION, question=item["prompt_A"])
+        elif hasattr(self.evaluator, "aime"):
+            msg_A = LATENTMAS_MATH_MSG_TEMPLATE.format(instruction=READER_AIME_INSTRUCTION, problem=item["prompt_A"])
+        elif hasattr(self.evaluator, "gsm8k"):
+            msg_A = LATENTMAS_MATH_MSG_TEMPLATE.format(instruction=READER_GSM8K_INSTRUCTION, problem=item["prompt_A"])
+        elif hasattr(self.evaluator, "mbppplus") or hasattr(self.evaluator, "humanevalplus"):
+            msg_A = LATENTMAS_CODE_GEN_MSG_TEMPLATE.format(instruction=READER_CODE_GEN_INSTRUCTION, problem=item["prompt_A"])
         else:
             msg_A = COMMUNICATION_QA_MSG_TEMPLATE_A.format(instruction=QA_INSTRUCTION, context=item["prompt_A"])
         input_ids_A = apply_chat_template(self.evaluator, self.tokenizer, msg_A, model_A, context=True)
 
+        # ── Receiver B ────────────────────────────────────────────────────────
+        # KVComm original tasks
         if hasattr(self.evaluator, "tmath"):
             msg_B = COMMUNICATION_MATH_MSG_TEMPLATE_B.format(instruction=MATH_INSTRUCTION, question=item["prompt_B"])
         elif hasattr(self.evaluator, "repobench"):
             msg_B = COMMUNICATION_CODE_MSG_TEMPLATE_B.format(instruction=CODE_INSTRUCTION, code_snippet=item["prompt_B"])
         elif hasattr(self.evaluator, "sasum"):
             msg_B = COMMUNICATION_SUMMARIZE_MSG_TEMPLATE_B.format(instruction=SUMMARIZE_INSTRUCTION, content_part_2=item["prompt_B"])
+        # LatentMAS tasks: B gets question + answer format instruction
+        elif hasattr(self.evaluator, "medqa") or hasattr(self.evaluator, "arc_easy") or hasattr(self.evaluator, "arc_challenge") or hasattr(self.evaluator, "gpqa"):
+            msg_B = LATENTMAS_MCQ_MSG_TEMPLATE_B.format(instruction=MCQ_INSTRUCTION, question=item["prompt_B"])
+        elif hasattr(self.evaluator, "aime"):
+            msg_B = LATENTMAS_AIME_MSG_TEMPLATE_B.format(instruction=AIME_INSTRUCTION, problem=item["prompt_B"])
+        elif hasattr(self.evaluator, "gsm8k"):
+            msg_B = LATENTMAS_GSM8K_MSG_TEMPLATE_B.format(instruction=GSM8K_INSTRUCTION, problem=item["prompt_B"])
+        elif hasattr(self.evaluator, "mbppplus") or hasattr(self.evaluator, "humanevalplus"):
+            msg_B = LATENTMAS_CODE_GEN_MSG_TEMPLATE_B.format(instruction=CODE_GEN_INSTRUCTION, problem=item["prompt_B"])
         else:
             msg_B = COMMUNICATION_QA_MSG_TEMPLATE_B.format(instruction=QA_INSTRUCTION, question=item["prompt_B"])
         input_ids_B = apply_chat_template(self.evaluator, self.tokenizer, msg_B, model_B)
@@ -375,32 +472,63 @@ class NLDEvaluator(CommunicationEvaluator):
         self.sender_aware = sender_aware
 
     def prepare_input_ids(self, item, model_A, model_B):
+        # ── Sender A ──────────────────────────────────────────────────────────
         if self.sender_aware:
+            # sender_aware: A summarizes content to help B
             if hasattr(self.evaluator, "tmath"):
                 msg_A = COMMUNICATION_MATH_MSG_TEMPLATE_A.format(instruction=SENDER_MATH_INSTRUCTION, hint=item["prompt_A"])
             elif hasattr(self.evaluator, "repobench"):
                 msg_A = COMMUNICATION_CODE_MSG_TEMPLATE_A.format(instruction=SENDER_CODE_INSTRUCTION, context=item["prompt_A"])
             elif hasattr(self.evaluator, "sasum"):
                 msg_A = COMMUNICATION_SUMMARIZE_MSG_TEMPLATE_A.format(instruction=SENDER_SUMMARIZE_INSTRUCTION, content_part_1=item["prompt_A"])
+            # LatentMAS tasks (sender_aware): A summarizes problem for B
+            elif hasattr(self.evaluator, "medqa") or hasattr(self.evaluator, "arc_easy") or hasattr(self.evaluator, "arc_challenge") or hasattr(self.evaluator, "gpqa"):
+                msg_A = LATENTMAS_MCQ_MSG_TEMPLATE.format(instruction=SENDER_MCQ_INSTRUCTION, question=item["prompt_A"])
+            elif hasattr(self.evaluator, "aime"):
+                msg_A = LATENTMAS_MATH_MSG_TEMPLATE.format(instruction=SENDER_AIME_INSTRUCTION, problem=item["prompt_A"])
+            elif hasattr(self.evaluator, "gsm8k"):
+                msg_A = LATENTMAS_MATH_MSG_TEMPLATE.format(instruction=SENDER_GSM8K_INSTRUCTION, problem=item["prompt_A"])
+            elif hasattr(self.evaluator, "mbppplus") or hasattr(self.evaluator, "humanevalplus"):
+                msg_A = LATENTMAS_CODE_GEN_MSG_TEMPLATE.format(instruction=SENDER_CODE_GEN_INSTRUCTION, problem=item["prompt_A"])
             else:
                 msg_A = COMMUNICATION_QA_MSG_TEMPLATE_A.format(instruction=SENDER_QA_INSTRUCTION, context=item["prompt_A"])
         else:
+            # standard: A reads/processes the content
             if hasattr(self.evaluator, "tmath"):
                 msg_A = COMMUNICATION_MATH_MSG_TEMPLATE_A.format(instruction=MATH_INSTRUCTION, hint=item["prompt_A"])
             elif hasattr(self.evaluator, "repobench"):
                 msg_A = COMMUNICATION_CODE_MSG_TEMPLATE_A.format(instruction=CODE_INSTRUCTION, context=item["prompt_A"])
             elif hasattr(self.evaluator, "sasum"):
                 msg_A = COMMUNICATION_SUMMARIZE_MSG_TEMPLATE_A.format(instruction=SUMMARIZE_INSTRUCTION, content_part_1=item["prompt_A"])
+            # LatentMAS tasks: A reads/encodes the full question
+            elif hasattr(self.evaluator, "medqa") or hasattr(self.evaluator, "arc_easy") or hasattr(self.evaluator, "arc_challenge") or hasattr(self.evaluator, "gpqa"):
+                msg_A = LATENTMAS_MCQ_MSG_TEMPLATE.format(instruction=READER_MCQ_INSTRUCTION, question=item["prompt_A"])
+            elif hasattr(self.evaluator, "aime"):
+                msg_A = LATENTMAS_MATH_MSG_TEMPLATE.format(instruction=READER_AIME_INSTRUCTION, problem=item["prompt_A"])
+            elif hasattr(self.evaluator, "gsm8k"):
+                msg_A = LATENTMAS_MATH_MSG_TEMPLATE.format(instruction=READER_GSM8K_INSTRUCTION, problem=item["prompt_A"])
+            elif hasattr(self.evaluator, "mbppplus") or hasattr(self.evaluator, "humanevalplus"):
+                msg_A = LATENTMAS_CODE_GEN_MSG_TEMPLATE.format(instruction=READER_CODE_GEN_INSTRUCTION, problem=item["prompt_A"])
             else:
                 msg_A = COMMUNICATION_QA_MSG_TEMPLATE_A.format(instruction=QA_INSTRUCTION, context=item["prompt_A"])
         input_ids_A = apply_chat_template(self.evaluator, self.tokenizer, msg_A, model_A)
 
+        # ── Receiver B ────────────────────────────────────────────────────────
         if hasattr(self.evaluator, "tmath"):
             msg_B = COMMUNICATION_MATH_MSG_TEMPLATE_B.format(instruction=MATH_INSTRUCTION, question=item["prompt_B"])
         elif hasattr(self.evaluator, "repobench"):
             msg_B = COMMUNICATION_CODE_MSG_TEMPLATE_B.format(instruction=CODE_INSTRUCTION, code_snippet=item["prompt_B"])
         elif hasattr(self.evaluator, "sasum"):
             msg_B = COMMUNICATION_SUMMARIZE_MSG_TEMPLATE_B.format(instruction=SUMMARIZE_INSTRUCTION, content_part_2=item["prompt_B"])
+        # LatentMAS tasks: B gets question + answer format instruction
+        elif hasattr(self.evaluator, "medqa") or hasattr(self.evaluator, "arc_easy") or hasattr(self.evaluator, "arc_challenge") or hasattr(self.evaluator, "gpqa"):
+            msg_B = LATENTMAS_MCQ_MSG_TEMPLATE_B.format(instruction=MCQ_INSTRUCTION, question=item["prompt_B"])
+        elif hasattr(self.evaluator, "aime"):
+            msg_B = LATENTMAS_AIME_MSG_TEMPLATE_B.format(instruction=AIME_INSTRUCTION, problem=item["prompt_B"])
+        elif hasattr(self.evaluator, "gsm8k"):
+            msg_B = LATENTMAS_GSM8K_MSG_TEMPLATE_B.format(instruction=GSM8K_INSTRUCTION, problem=item["prompt_B"])
+        elif hasattr(self.evaluator, "mbppplus") or hasattr(self.evaluator, "humanevalplus"):
+            msg_B = LATENTMAS_CODE_GEN_MSG_TEMPLATE_B.format(instruction=CODE_GEN_INSTRUCTION, problem=item["prompt_B"])
         else:
             msg_B = COMMUNICATION_QA_MSG_TEMPLATE_B.format(instruction=QA_INSTRUCTION, question=item["prompt_B"])
         input_ids_B = apply_chat_template(self.evaluator, self.tokenizer, msg_B, model_B)

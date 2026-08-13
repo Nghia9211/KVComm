@@ -53,6 +53,16 @@ LATENT_SENDER_AIME_INSTRUCTION = (
     "Work through all algebraic, geometric, or combinatorial reasoning carefully. "
     "Your internal reasoning will be used by another agent to compute the final answer."
 )
+LATENT_SENDER_GSM8K_INSTRUCTION = (
+    "Think deeply about the following math word problem. "
+    "Work through the arithmetic and logical reasoning step by step. "
+    "Your internal reasoning will be used by another agent to compute the final answer."
+)
+LATENT_SENDER_MCQ_INSTRUCTION = (
+    "Think deeply about the following question and each answer option. "
+    "Analyze the key information and relationships between options carefully. "
+    "Your internal reasoning will be used by another agent to select the correct answer."
+)
 
 
 # ── Sender A: Non-think instructions (Llama-3 and other non-thinking models) ───
@@ -91,6 +101,14 @@ LATENT_SENDER_AIME_INSTRUCTION_NOTHINK = (
     "You are a reader agent. Read the following competition mathematics problem carefully "
     "and reason about the numerical constraints, relationships, and mathematical concepts."
 )
+LATENT_SENDER_GSM8K_INSTRUCTION_NOTHINK = (
+    "You are a reader agent. Read the following math word problem carefully "
+    "and reason about the numbers, operations, and logical steps needed to solve it."
+)
+LATENT_SENDER_MCQ_INSTRUCTION_NOTHINK = (
+    "You are a reader agent. Read the following question and answer choices carefully "
+    "and reason about the key information and relationships between options."
+)
 
 
 # ── Receiver B: Latent-awareness prefix ───────────────────────────────────────
@@ -123,13 +141,18 @@ def build_latent_sender_msg(evaluator, item: dict, is_think: bool = False) -> st
                         which explicitly asks model to encode key information.
 
     Supported evaluator task flags:
-      evaluator.tmath     → math hint (KVComm original)
-      evaluator.repobench → code context (KVComm original)
-      evaluator.sasum     → summarization (KVComm original)
-      evaluator.medqa     → medical MCQ (LatentMAS task)
-      evaluator.mbppplus  → code generation (LatentMAS task)
-      evaluator.aime      → competition math (LatentMAS task)
-      (default)           → QA / general context (KVComm original)
+      evaluator.tmath       → math hint (KVComm original)
+      evaluator.repobench   → code context (KVComm original)
+      evaluator.sasum       → summarization (KVComm original)
+      evaluator.medqa       → medical MCQ (LatentMAS task)
+      evaluator.mbppplus    → code generation (LatentMAS task)
+      evaluator.aime        → competition math (LatentMAS task)
+      evaluator.gsm8k       → math word problem (LatentMAS task)
+      evaluator.arc_easy    → MCQ science easy (LatentMAS task)
+      evaluator.arc_challenge → MCQ science hard (LatentMAS task)
+      evaluator.gpqa        → MCQ graduate science (LatentMAS task)
+      evaluator.humanevalplus → code generation HumanEval+ (LatentMAS task)
+      (default)             → QA / general context (KVComm original)
 
     Args:
         evaluator: Task evaluator (used to detect task type via hasattr flags).
@@ -147,6 +170,8 @@ def build_latent_sender_msg(evaluator, item: dict, is_think: bool = False) -> st
         medqa_inst     = LATENT_SENDER_MEDQA_INSTRUCTION
         code_gen_inst  = LATENT_SENDER_CODE_GEN_INSTRUCTION
         aime_inst      = LATENT_SENDER_AIME_INSTRUCTION
+        gsm8k_inst     = LATENT_SENDER_GSM8K_INSTRUCTION
+        mcq_inst       = LATENT_SENDER_MCQ_INSTRUCTION
     else:
         math_inst      = LATENT_SENDER_MATH_INSTRUCTION_NOTHINK
         qa_inst        = LATENT_SENDER_QA_INSTRUCTION_NOTHINK
@@ -155,6 +180,8 @@ def build_latent_sender_msg(evaluator, item: dict, is_think: bool = False) -> st
         medqa_inst     = LATENT_SENDER_MEDQA_INSTRUCTION_NOTHINK
         code_gen_inst  = LATENT_SENDER_CODE_GEN_INSTRUCTION_NOTHINK
         aime_inst      = LATENT_SENDER_AIME_INSTRUCTION_NOTHINK
+        gsm8k_inst     = LATENT_SENDER_GSM8K_INSTRUCTION_NOTHINK
+        mcq_inst       = LATENT_SENDER_MCQ_INSTRUCTION_NOTHINK
 
     # ── KVComm original tasks ──────────────────────────────────────────────────
     if hasattr(evaluator, "tmath"):
@@ -182,6 +209,15 @@ def build_latent_sender_msg(evaluator, item: dict, is_think: bool = False) -> st
     elif hasattr(evaluator, "aime"):
         # A thinks about the competition problem
         return f"Instruction: {aime_inst} Problem: {item['prompt_A']}"
+    elif hasattr(evaluator, "gsm8k"):
+        # A thinks about the math word problem
+        return f"Instruction: {gsm8k_inst} Problem: {item['prompt_A']}"
+    elif hasattr(evaluator, "arc_easy") or hasattr(evaluator, "arc_challenge") or hasattr(evaluator, "gpqa"):
+        # A thinks about the MCQ question and options
+        return f"Instruction: {mcq_inst} Question: {item['prompt_A']}"
+    elif hasattr(evaluator, "humanevalplus"):
+        # A thinks about the HumanEval+ programming problem (reuse code_gen_inst)
+        return f"Instruction: {code_gen_inst} Problem: {item['prompt_A']}"
     else:
         # Default: QA / general context
         return _SENDER_QA_TMPL.format(
@@ -267,8 +303,47 @@ def build_latent_receiver_msg(evaluator, item: dict) -> str:
             f"You are provided with latent reasoning context from another agent. "
             f"Use it to reason step-by-step and find the exact integer answer.\n\n"
             f"{item['prompt_B']}\n\n"
-            f"Reason step by step, then output the final integer answer inside "
-            f"\\boxed{{YOUR_FINAL_ANSWER}}."
+            f"Reason step by step and output the final integer answer inside "
+            f"\\boxed{{YOUR_FINAL_ANSWER}}.\n"
+            f"Now, reason step by step and output the final answer inside \\boxed{{YOUR_FINAL_ANSWER}}."
+        )
+        return LATENT_RECEIVER_PREFIX + core
+    elif hasattr(evaluator, "gsm8k"):
+        # B solves a math word problem: must output \boxed{N}
+        core = (
+            f"You are a math problem solver. "
+            f"You are provided with latent reasoning context from another agent. "
+            f"Use it to reason step-by-step and find the correct numerical answer.\n\n"
+            f"{item['prompt_B']}\n\n"
+            f"Your final answer must be a number. "
+            f"Reason step by step and output the final answer inside "
+            f"\\boxed{{YOUR_FINAL_ANSWER}}.\n"
+            f"Now, reason step by step and output the final answer inside \\boxed{{YOUR_FINAL_ANSWER}}."
+        )
+        return LATENT_RECEIVER_PREFIX + core
+    elif hasattr(evaluator, "arc_easy") or hasattr(evaluator, "arc_challenge") or hasattr(evaluator, "gpqa"):
+        # B answers a science/graduate MCQ: must output \boxed{A/B/C/D}
+        core = (
+            f"You are a question answering assistant. "
+            f"You are provided with latent context from another reasoning agent. "
+            f"Use it to reason step-by-step and select the correct answer.\n\n"
+            f"{item['prompt_B']}\n\n"
+            f"Your final answer must be selected from A, B, C, D. "
+            f"For example \\boxed{{A}}. Do not add any other content inside the box.\n"
+            f"Now, reason step by step and output the final answer inside \\boxed{{YOUR_FINAL_ANSWER}}."
+        )
+        return LATENT_RECEIVER_PREFIX + core
+    elif hasattr(evaluator, "humanevalplus"):
+        # B generates Python code: must output ```python ... ```
+        core = (
+            f"You are a Python programming assistant. "
+            f"You are provided with latent context from another reasoning agent. "
+            f"Use it to write a correct, self-contained solution.\n\n"
+            f"{item['prompt_B']}\n\n"
+            f"Put all your Python code inside a markdown code block:\n"
+            f"```python\nYOUR_CODE_HERE\n```\n"
+            f"Do not add any other content inside the code block.\n"
+            f"Now, reason step by step and output the final answer inside ```python\nYOUR_PYTHON_CODE\n```."
         )
         return LATENT_RECEIVER_PREFIX + core
     else:

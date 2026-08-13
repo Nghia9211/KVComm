@@ -12,6 +12,13 @@ from .samsum import SAMSumEvaluator
 from .medqa import MedQAEvaluator
 from .mbppplus import MBPPPlusEvaluator
 from .aime2024 import AIME2024Evaluator
+# Additional tasks
+from .aime2025 import AIME2025Evaluator
+from .arc_challenge import ARCChallengeEvaluator
+from .arc_easy import ARCEasyEvaluator
+from .gpqa import GPQAEvaluator
+from .gsm8k import GSM8KEvaluator
+from .humanevalplus import HumanEvalPlusEvaluator
 
 def get_evaluator(test_task: str):
     if test_task == "countries":
@@ -47,6 +54,19 @@ def get_evaluator(test_task: str):
         return MBPPPlusEvaluator()
     elif test_task == "aime2024":
         return AIME2024Evaluator()
+    # ── Additional tasks ─────────────────────────────────────────────────
+    elif test_task == "aime2025":
+        return AIME2025Evaluator()
+    elif test_task == "arc_challenge":
+        return ARCChallengeEvaluator()
+    elif test_task == "arc_easy":
+        return ARCEasyEvaluator()
+    elif test_task == "gpqa":
+        return GPQAEvaluator()
+    elif test_task == "gsm8k":
+        return GSM8KEvaluator()
+    elif test_task == "humanevalplus":
+        return HumanEvalPlusEvaluator()
     else:
         raise ValueError(f"Unsupported task name: {test_task}")
 

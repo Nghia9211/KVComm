@@ -274,6 +274,8 @@ def get_short_past_key_values(past_key_values: DynamicCache):
 
 
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+
+@torch._dynamo.disable
 def forward_shift_back_llama(
     model: PreTrainedModel,
     input_ids: Optional[torch.LongTensor] = None,
@@ -397,6 +399,7 @@ def forward_shift_back_llama(
         attentions=None,
     )
 
+@torch._dynamo.disable
 def forward_shift_back_qwen2(
     model: PreTrainedModel,
     input_ids: Optional[torch.LongTensor] = None,
