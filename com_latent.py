@@ -101,6 +101,13 @@ class LatentAlignConfig:
     # latent_only=False → B receives full T_input + N_latent KV tokens (backward-compat)
     # latent_only=True  → B receives only the N_latent compressed thought tokens
     latent_only: bool = False
+    allow_b_think: bool = False
+    # max_tokens_B=0 → use evaluator's default (task-specific).
+    # Set > 0 to grant B extra output headroom, e.g. 4096 when allow_b_think=True
+    # so the model can reason inside <think>…</think> before giving the final answer.
+    # Only applies to --do_test_latent (LatentMAS). Other modes are unaffected.
+    max_tokens_B: int = 0
+    batch_size: int = 1
 
     # ── Task ──────────────────────────────────────────────────────────────
     test_task: str = "tmath"
@@ -165,9 +172,13 @@ def main(cfg: LatentAlignConfig):
     logging.info(f"Outputs will be saved to: {final_snapshot_path}")
     log_gpu_info()
 
-    # Response log file (written alongside log.log in the same snapshot folder)
-    response_log_path = os.path.join(final_snapshot_path, "responses.jsonl")
-    logging.info(f"Response log will be saved to: {response_log_path}")
+    # Response log paths — one file per mode so they don't overwrite each other
+    response_log_dir  = final_snapshot_path
+    response_log_path = os.path.join(response_log_dir, "responses.jsonl")  # default (latent)
+    skyline_log_path  = os.path.join(response_log_dir, "skyline_responses.jsonl")
+    baseline_log_path = os.path.join(response_log_dir, "baseline_responses.jsonl")
+    kvcomm_log_path   = os.path.join(response_log_dir, "kvcomm_responses.jsonl")
+    logging.info(f"Response logs will be saved to: {response_log_dir}/{{skyline|baseline|kvcomm|latent}}_responses.jsonl")
 
     # ── W&B ───────────────────────────────────────────────────────────────
     if cfg.use_wandb:
@@ -228,7 +239,8 @@ def main(cfg: LatentAlignConfig):
     if cfg.do_test_skyline:
         logging.info("Running skyline evaluation...")
         skyline_evaluator = SkylineEvaluator(
-            evaluator, tokenizer, cfg.use_wandb, cfg.max_input_length
+            evaluator, tokenizer, cfg.use_wandb, cfg.max_input_length,
+            response_log_path=skyline_log_path,
         )
         results = skyline_evaluator.test(model_A, model_B, limit=cfg.limit)
 
@@ -236,7 +248,8 @@ def main(cfg: LatentAlignConfig):
     if cfg.do_test_baseline:
         logging.info("Running baseline evaluation...")
         baseline_evaluator = BaselineEvaluator(
-            evaluator, tokenizer, cfg.use_wandb, cfg.max_input_length
+            evaluator, tokenizer, cfg.use_wandb, cfg.max_input_length,
+            response_log_path=baseline_log_path,
         )
         results = baseline_evaluator.test(model_A, model_B, limit=cfg.limit)
 
@@ -245,7 +258,7 @@ def main(cfg: LatentAlignConfig):
         logging.info("Running regular KVComm evaluation (no latent)...")
         comm_evaluator = CommunicationEvaluator(
             evaluator, tokenizer, cfg.use_wandb, cfg.max_input_length,
-            response_log_path=response_log_path,
+            response_log_path=kvcomm_log_path,
         )
         cv = CVCommunicator(
             model_A, model_B,
@@ -310,9 +323,12 @@ def main(cfg: LatentAlignConfig):
                 max_input_length=cfg.max_input_length,
                 latent_mas=latent_mas,
                 cv=cv,
+                latent_only=cfg.latent_only,
+                allow_b_think=cfg.allow_b_think,
+                max_tokens_B=cfg.max_tokens_B,
                 response_log_path=response_log_path,
             )
-            results = latent_evaluator.test(model_A, cv, limit=cfg.limit)
+            results = latent_evaluator.test(model_A, cv, limit=cfg.limit, batch_size=cfg.batch_size)
 
         else:
             # Mode 2: KVComm layer selection + LatentMAS
@@ -342,6 +358,8 @@ def main(cfg: LatentAlignConfig):
                     latent_mas=latent_mas,
                     cv=cv,
                     latent_only=cfg.latent_only,
+                    allow_b_think=cfg.allow_b_think,
+                    max_tokens_B=cfg.max_tokens_B,
                     response_log_path=response_log_path,
                 )
                 results = latent_evaluator.test(model_A, cv, limit=cfg.limit)
@@ -378,6 +396,8 @@ def main(cfg: LatentAlignConfig):
                     latent_mas=latent_mas,
                     cv=cv_calib,
                     latent_only=cfg.latent_only,
+                    allow_b_think=cfg.allow_b_think,
+                    max_tokens_B=cfg.max_tokens_B,
                     response_log_path=response_log_path,
                 )
 
@@ -406,7 +426,7 @@ def main(cfg: LatentAlignConfig):
 
                     # Step 6a: Reset layer importance and run actual evaluation
                     latent_evaluator.layer_importance_total = defaultdict(list)
-                    results = latent_evaluator.test(model_A, cv, limit=cfg.limit)
+                    results = latent_evaluator.test(model_A, cv, limit=cfg.limit, batch_size=cfg.batch_size)
 
                 else:
                     # Step 3b (do_layer_curve): Calibrate → full layer ranking
@@ -435,7 +455,7 @@ def main(cfg: LatentAlignConfig):
                             shift_back=cfg.shift_back,
                         )
                         latent_evaluator.layer_importance_total = defaultdict(list)
-                        result = latent_evaluator.test(model_A, cv_i, limit=cfg.limit)
+                        result = latent_evaluator.test(model_A, cv_i, limit=cfg.limit, batch_size=cfg.batch_size)
                         results.append(result)
                     logging.info(f"Mode 2 AUTO layer_curve results: {results}")
                     if cfg.use_wandb:
@@ -465,11 +485,13 @@ def main(cfg: LatentAlignConfig):
                     latent_mas=latent_mas,
                     cv=cv,
                     latent_only=cfg.latent_only,
+                    allow_b_think=cfg.allow_b_think,
+                    max_tokens_B=cfg.max_tokens_B,
                     response_log_path=response_log_path,
                 )
 
                 if not cfg.do_layer_curve:
-                    results = latent_evaluator.test(model_A, cv, limit=cfg.limit)
+                    results = latent_evaluator.test(model_A, cv, limit=cfg.limit, batch_size=cfg.batch_size)
                 else:
                     # Manual do_layer_curve: iterate prefix of layers_list by position
                     results = []

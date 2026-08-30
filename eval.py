@@ -114,7 +114,7 @@ def is_think_model(model):
         return True
     return False
 
-def apply_chat_template(evaluator, tokenizer, msg, model, context=False):
+def apply_chat_template(evaluator, tokenizer, msg, model, context=False, allow_b_think=False):
     input_ids = tokenizer.apply_chat_template(
         [{"role": "user", "content": msg}],
         add_generation_prompt=True,
@@ -122,22 +122,34 @@ def apply_chat_template(evaluator, tokenizer, msg, model, context=False):
     ).to(model.device)
 
     if is_think_model(model):
-        think_model_prefix = "</think>\n\n"
-        if not context and evaluator.name not in ["tipsheets", "repobench"]:
-            # for tipsheets, we do not add "The answer is: " as there is already
-            # an answer prefix in the data
-            if evaluator.name == "countries":
-                think_model_prefix += "The only country is:"
-            else:
-                think_model_prefix += "The answer is: "
-        
         if context:
             think_token_id = tokenizer.convert_tokens_to_ids("<think>")
             # remove the think token from the input ids
-            input_ids = input_ids[input_ids != think_token_id].unsqueeze(0)
-        else:
+            if think_token_id is not None:
+                input_ids = input_ids[input_ids != think_token_id].unsqueeze(0)
+        elif not allow_b_think:
+            # Original pre-seeding behaviour (suppresses B's thinking)
+            think_model_prefix = "</think>\n\n"
+            if evaluator.name not in ["tipsheets", "repobench"]:
+                # for tipsheets, we do not add "The answer is: " as there is already
+                # an answer prefix in the data
+                if evaluator.name == "countries":
+                    think_model_prefix += "The only country is:"
+                else:
+                    think_model_prefix += "The answer is: "
             end_think_token_id = tokenizer.encode(think_model_prefix, add_special_tokens=False)
             input_ids = torch.cat([input_ids, torch.tensor([end_think_token_id], device=model.device)], dim=-1)
+        else:
+            # Fix B1: Allow B to think by ensuring <think> token is present
+            think_token_id = tokenizer.convert_tokens_to_ids("<think>")
+            if think_token_id is None:
+                think_ids = tokenizer.encode("<think>", add_special_tokens=False)
+                think_tensor = torch.tensor([think_ids], device=model.device)
+            else:
+                think_tensor = torch.tensor([[think_token_id]], device=model.device)
+            # Check if input_ids already ends with think_token to prevent double <think>
+            if input_ids.shape[-1] < think_tensor.shape[-1] or not torch.equal(input_ids[:, -think_tensor.shape[-1]:], think_tensor):
+                input_ids = torch.cat([input_ids, think_tensor], dim=-1)
     return input_ids
 
 class SkylineEvaluator:
@@ -274,9 +286,11 @@ class BaselineEvaluator(SkylineEvaluator):
 
 class CommunicationEvaluator(SkylineEvaluator):
     def __init__(self, evaluator, tokenizer, use_wandb, max_input_length,
+                 allow_b_think: bool = False,
                  response_log_path: Optional[str] = None):
         super().__init__(evaluator, tokenizer, use_wandb, max_input_length)
         self.name = "communication"
+        self.allow_b_think = allow_b_think
         self.layer_importance_total = defaultdict(list)
         self.response_log_path = response_log_path
     
@@ -327,7 +341,7 @@ class CommunicationEvaluator(SkylineEvaluator):
             msg_B = LATENTMAS_CODE_GEN_MSG_TEMPLATE_B.format(instruction=CODE_GEN_INSTRUCTION, problem=item["prompt_B"])
         else:
             msg_B = COMMUNICATION_QA_MSG_TEMPLATE_B.format(instruction=QA_INSTRUCTION, question=item["prompt_B"])
-        input_ids_B = apply_chat_template(self.evaluator, self.tokenizer, msg_B, model_B)
+        input_ids_B = apply_chat_template(self.evaluator, self.tokenizer, msg_B, model_B, allow_b_think=self.allow_b_think)
         
         # truncate in the middle of the input
         input_ids_A, input_ids_B = self.truncate_input(input_ids_A, input_ids_B)
@@ -355,8 +369,77 @@ class CommunicationEvaluator(SkylineEvaluator):
         response = self.get_response(output, context_length)
         return response
 
-    def _test(self, model_A, cv, limit=None, do_calc_layer_importance=False):
-        progress_bar = tqdm(self.evaluator, desc=f"{self.name} result: 0.0000", disable=do_calc_layer_importance)
+    def inference_batch(self, cv, items):
+        """
+        Run batched inference for regular KVComm (batch_size > 1).
+        """
+        if len(items) == 1:
+            return [self.inference(cv.A, cv, items[0])]
+
+        batch_size = len(items)
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+
+        # 1. Prepare individual input_ids
+        ids_A_list, ids_B_list = [], []
+        for item in items:
+            ids_A, ids_B = self.prepare_input_ids(item, cv.A, cv.B)
+            ids_A_list.append(ids_A[0])
+            ids_B_list.append(ids_B[0])
+
+        # 2. Right-padding A (prefill on Model A)
+        max_len_A = max(ids.shape[0] for ids in ids_A_list)
+        input_ids_A = torch.full((batch_size, max_len_A), pad_id, dtype=torch.long, device=cv.A.device)
+        attention_mask_A = torch.zeros((batch_size, max_len_A), dtype=torch.long, device=cv.A.device)
+
+        for i, ids in enumerate(ids_A_list):
+            l = ids.shape[0]
+            input_ids_A[i, :l] = ids
+            attention_mask_A[i, :l] = 1
+
+        # 3. Model A forward pass
+        out_A = cv.A(
+            input_ids=input_ids_A,
+            attention_mask=attention_mask_A,
+            use_cache=True,
+            return_dict=True,
+        )
+        out_A_past_key_values = out_A.past_key_values
+
+        # 4. Left-padding B (required for CausalLM generation)
+        max_len_B = max(ids.shape[0] for ids in ids_B_list)
+        input_ids_B = torch.full((batch_size, max_len_B), pad_id, dtype=torch.long, device=cv.B.device)
+        attention_mask_B_tokens = torch.zeros((batch_size, max_len_B), dtype=torch.long, device=cv.B.device)
+
+        for i, ids in enumerate(ids_B_list):
+            l = ids.shape[0]
+            input_ids_B[i, -l:] = ids
+            attention_mask_B_tokens[i, -l:] = 1
+
+        # 5. Concatenate past_mask (attention_mask_A) with attention_mask_B_tokens
+        attention_mask_B = torch.cat([attention_mask_A, attention_mask_B_tokens], dim=1)
+
+        # 6. Batched Generation on B
+        outputs = cv.generate(
+            input_ids_B,
+            attention_mask=attention_mask_B,
+            out_A_past_key_values=out_A_past_key_values,
+            **self.generate_args,
+        )
+
+        # 7. Decode responses
+        responses = []
+        for i in range(batch_size):
+            response_i = self.get_response(outputs[i], max_len_B)
+            responses.append(response_i)
+
+        return responses
+
+    def _test(self, model_A, cv, limit=None, do_calc_layer_importance=False, batch_size=1):
+        items_all = list(self.evaluator)
+        if limit is not None:
+            items_all = items_all[:limit]
+
+        progress_bar = tqdm(range(0, len(items_all), batch_size), desc=f"{self.name} result: 0.0000", disable=do_calc_layer_importance)
 
         # Open response log file once for the entire test run
         response_log_file = None
@@ -364,32 +447,39 @@ class CommunicationEvaluator(SkylineEvaluator):
             response_log_file = open(self.response_log_path, "a", encoding="utf-8")
 
         try:
-            for i, item in enumerate(progress_bar):
-                if limit is not None and i >= limit:
-                    break
-                response = self.inference(model_A, cv, item)
+            for start_idx in progress_bar:
+                batch_items = items_all[start_idx : start_idx + batch_size]
+                if len(batch_items) > 1 and not do_calc_layer_importance:
+                    responses = self.inference_batch(cv, batch_items)
+                else:
+                    responses = [self.inference(model_A, cv, item) for item in batch_items]
 
                 if do_calc_layer_importance:
                     cv.calc_attn_weights_from_qk()
                     self.layer_importance_total = calc_layer_importance(cv.B_attn_weights, model_A.name, self.layer_importance_total)
 
-                self.evaluator.evaluate_item(item, response)
+                for i, (item, response) in enumerate(zip(batch_items, responses)):
+                    prev_total = self.evaluator.f1_total
+                    self.evaluator.evaluate_item(item, response)
+                    item_score = self.evaluator.f1_total - prev_total
 
-                result = self.evaluator.get_result()
-                progress_bar.set_description(f"{self.name} result: {result:.4f}")
+                    result = self.evaluator.get_result()
+                    progress_bar.set_description(f"{self.name} result: {result:.4f}")
 
-                # Write response log entry
-                if response_log_file is not None:
-                    record = {
-                        "idx": i,
-                        "prompt_a": item.get("prompt_A", ""),
-                        "prompt_b": item.get("prompt_B", ""),
-                        "response": response,
-                        "answer": item.get("answer", ""),
-                        "result_so_far": round(result, 4),
-                    }
-                    response_log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
-                    response_log_file.flush()
+                    # Write response log entry
+                    if response_log_file is not None:
+                        record = {
+                            "idx":           start_idx + i,
+                            "mode":          self.name,
+                            "prompt_a":      item.get("prompt_A", ""),
+                            "prompt_b":      item.get("prompt_B", ""),
+                            "response":      response,
+                            "answer":        item.get("answer", ""),
+                            "item_score":    round(item_score, 4),
+                            "result_so_far": round(result, 4),
+                        }
+                        response_log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+                        response_log_file.flush()
         finally:
             if response_log_file is not None:
                 response_log_file.close()
@@ -398,9 +488,9 @@ class CommunicationEvaluator(SkylineEvaluator):
         return result
     
     @torch.no_grad()
-    def test(self, model_A, cv, limit=None, do_calc_layer_importance=False, no_wandb=False):
+    def test(self, model_A, cv, limit=None, do_calc_layer_importance=False, no_wandb=False, batch_size=1):
         tic = time.time()
-        result = self._test(model_A, cv, limit, do_calc_layer_importance)
+        result = self._test(model_A, cv, limit, do_calc_layer_importance, batch_size=batch_size)
         toc = time.time()
         time_used = toc - tic
         if self.use_wandb and not no_wandb and not do_calc_layer_importance:

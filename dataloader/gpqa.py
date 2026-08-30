@@ -15,7 +15,9 @@ Notes:
   - The "question" field in the dataset already includes answer options.
   - The "answer" field is the full text of the correct option; we map it
     back to a letter by matching against the option texts.
-  - max_tokens = 512 (MCQ with reasoning).
+  - max_tokens = 1024 (MCQ with reasoning; graduate-level needs longer chains).
+  - LatentMAS recommended override (--max_tokens_B):
+      N=10 → 4096, N=20 → 2048, N=40 → 1536
 
 Attributes used by prompts_latent.py:
   self.gpqa = True
@@ -65,7 +67,9 @@ class GPQAEvaluator(BaseEvaluator):
 
     def __init__(self, n_samples: int = None):
         super().__init__()
-        self.max_tokens = 512
+        self.max_tokens = 1024      # Graduate-level science MCQ: needs 1024+ for reasoning.
+                                     # For LatentMAS allow_b_think=True, use --max_tokens_B:
+                                     #   N=10 → 4096, N=20 → 2048, N=40 → 1536
         self.truncate_input = True
         self.multiple_answers = False
         self.n_samples = n_samples

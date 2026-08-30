@@ -9,7 +9,9 @@ from typing import Dict, Any
 class TMathEvaluator(BaseEvaluator):
     def __init__(self):
         super().__init__()
-        self.max_tokens = 256
+        self.max_tokens = 512        # TMATH: hint-based math, needs modest reasoning chain.
+                                     # For LatentMAS allow_b_think=True, use --max_tokens_B:
+                                     #   N=10 → 1536, N=20 → 1024, N=40 → 768
         self.truncate_input = True
         self.multiple_answers = False
         self.n_samples = 300

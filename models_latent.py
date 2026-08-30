@@ -64,13 +64,97 @@ class LatentMAS:
         self._target_norm: Optional[torch.Tensor] = None
 
         self._build_realign_matrix()
+        # Cache the layer→device mapping for device_map="auto" support.
+        # Built lazily on first run() call (model must be fully loaded first).
+        self._layer_devices: Optional[list] = None
         logging.info(
             f"LatentMAS initialized: latent_steps={latent_steps}, "
             f"latent_space_realign={latent_space_realign}"
         )
 
     # ------------------------------------------------------------------
-    # Realignment matrix
+    # Device helpers (for device_map="auto" / Accelerate offloading)
+    # ------------------------------------------------------------------
+
+    def _build_layer_devices(self) -> list:
+        """
+        Return a list of torch.device, one per transformer layer.
+
+        When device_map="auto" is used with Accelerate, different layers
+        may reside on different devices (cuda:0, cuda:1, cpu, or even
+        meta for fully-offloaded layers).  We must move KV tensors to the
+        device where that layer's parameters actually live *before* calling
+        DynamicCache.update(), otherwise torch.cat raises:
+
+            RuntimeError: Tensor on device cuda:0 is not on the expected
+                          device meta!
+
+        For models where all layers are on one device this is a no-op.
+        """
+        devices = []
+        model = self.model
+
+        # Resolve the actual layer list (handles multimodal wrappers)
+        if hasattr(model, "model") and hasattr(model.model, "layers"):
+            layers = model.model.layers
+        elif hasattr(model, "model") and hasattr(model.model, "language_model"):
+            layers = model.model.language_model.layers
+        else:
+            layers = []
+
+        for layer in layers:
+            try:
+                # k_proj weight lives on the actual compute device of this layer
+                dev = layer.self_attn.k_proj.weight.device
+            except AttributeError:
+                try:
+                    dev = next(layer.parameters()).device
+                except StopIteration:
+                    dev = next(model.parameters()).device
+            devices.append(dev)
+
+        if not devices:
+            # Fallback: all layers on the same device as the first parameter
+            devices = [next(model.parameters()).device]
+
+        logging.debug(
+            f"LatentMAS layer devices: "
+            + ", ".join(f"L{i}={d}" for i, d in enumerate(devices[:4]))
+            + (" ..." if len(devices) > 4 else "")
+        )
+        return devices
+
+    def _normalize_cache_devices(self, past: DynamicCache) -> DynamicCache:
+        """
+        Move each layer's KV tensors to the correct device for that layer.
+
+        This prevents the "cuda:0 is not on the expected device meta" error
+        that occurs when device_map="auto" spreads layers across devices.
+
+        Creates a *new* DynamicCache (does not mutate the input) to avoid
+        in-place side-effects on the accumulated past.
+        """
+        if self._layer_devices is None:
+            self._layer_devices = self._build_layer_devices()
+
+        layer_devices = self._layer_devices
+        n_layers = len(past.key_cache)
+
+        # Fast path: single device — no movement needed
+        if len(set(str(d) for d in layer_devices)) == 1:
+            return past
+
+        new_cache = DynamicCache()
+        for i in range(n_layers):
+            # Pick device for this layer (clamp index if fewer devices registered)
+            dev = layer_devices[min(i, len(layer_devices) - 1)]
+            k = past.key_cache[i].to(dev)
+            v = past.value_cache[i].to(dev)
+            new_cache.update(k, v, i)
+
+        new_cache._seen_tokens = past._seen_tokens
+        return new_cache
+
     # Ported from: LatentMAS/models.py ModelWrapper._build_latent_realign_matrix()
     # ------------------------------------------------------------------
 
@@ -270,7 +354,21 @@ class LatentMAS:
                 f"input_ids must be 2D [batch, seq_len], got shape {tuple(input_ids.shape)}"
             )
 
-        device    = next(self.model.parameters()).device
+        # Resolve the input device: use the embedding layer's device so that
+        # input_ids land on the first real compute device, even with
+        # device_map="auto" where next(parameters()) might return "meta".
+        try:
+            device = self.model.get_input_embeddings().weight.device
+        except Exception:
+            device = next(
+                (p.device for p in self.model.parameters() if p.device.type != "meta"),
+                torch.device("cpu"),
+            )
+
+        # Build layer→device map lazily (needed for _normalize_cache_devices)
+        if self._layer_devices is None:
+            self._layer_devices = self._build_layer_devices()
+
         input_ids = input_ids.to(device)
 
         if attention_mask is None:
@@ -302,13 +400,13 @@ class LatentMAS:
             latent_vec   = self._apply_realignment(last_hidden)    # [B, D]
             latent_embed = latent_vec.unsqueeze(1)                  # [B, 1, D]
 
-            # b. Attention mask covering past tokens + this new latent token
-            past_len    = past.get_seq_length()
-            latent_mask = torch.ones(
-                (latent_embed.shape[0], past_len + 1),
-                dtype=torch.long,
-                device=latent_embed.device,
+            # b. Fix B3: Attention mask preserving pad-token masks + new latent tokens
+            latent_ones = torch.ones(
+                (input_ids.shape[0], step + 1),
+                dtype=attention_mask.dtype,
+                device=attention_mask.device,
             )
+            latent_mask = torch.cat([attention_mask, latent_ones], dim=1)
 
             # c. Forward with latent embedding (inputs_embeds, no input_ids)
             outputs = self.model(
@@ -320,6 +418,16 @@ class LatentMAS:
                 return_dict=True,
             )
             past        = outputs.past_key_values                   # DynamicCache updated
+
+            # ── Device normalization (critical for device_map="auto") ──────
+            # When Accelerate spreads layers across devices, the KV tensors
+            # returned from the forward pass may be on mixed devices.  The
+            # NEXT forward call will then try to torch.cat a cuda:0 tensor
+            # with a meta tensor, causing:
+            #   RuntimeError: Tensor on device cuda:0 is not on the expected
+            #                 device meta!
+            # Move every layer’s K/V to the device where that layer lives.
+            past        = self._normalize_cache_devices(past)
             last_hidden = outputs.hidden_states[-1][:, -1, :]       # [B, D]
 
             logging.debug(

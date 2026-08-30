@@ -40,10 +40,12 @@ class AlignConfig:
     sigma: float = 10.0
     random_selection: bool = False
     shift_back: bool = False
+    allow_b_think: bool = False
     # Test dataset configuration
     test_task: str = "tipsheets"
     task_name: str = ""
     limit: int = 0
+    batch_size: int = 1
     # Test configuration
     do_test: bool = False
     do_test_skyline: bool = False
@@ -148,7 +150,7 @@ def main(cfg: AlignConfig):
         baseline_evaluator = BaselineEvaluator(evaluator, tokenizer, cfg.use_wandb, cfg.max_input_length)
         results = baseline_evaluator.test(model_A, model_B, limit=cfg.limit)
     if cfg.do_test:
-        communication_evaluator = CommunicationEvaluator(evaluator, tokenizer, cfg.use_wandb, cfg.max_input_length)
+        communication_evaluator = CommunicationEvaluator(evaluator, tokenizer, cfg.use_wandb, cfg.max_input_length, allow_b_think=cfg.allow_b_think)
         if cfg.top_layers > 0:
             cv = CVCommunicator(model_A, model_B, cfg.layer_from, cfg.layer_to, layers_list=cfg.layers_list, top_layers=cfg.top_layers, apply_attn_tracer=True, shift_back=False)
             if cfg.random_selection:
@@ -163,14 +165,14 @@ def main(cfg: AlignConfig):
             layer_ranking = get_layer_ranking(communication_evaluator.layer_importance_total, cfg)
         if not cfg.do_layer_curve:
             cv = CVCommunicator(model_A, model_B, cfg.layer_from, cfg.layer_to, layers_list=cfg.layers_list, top_layers=cfg.top_layers, apply_attn_tracer=False, shift_back=cfg.shift_back)
-            results = communication_evaluator.test(model_A, cv, limit=cfg.limit)
+            results = communication_evaluator.test(model_A, cv, limit=cfg.limit, batch_size=cfg.batch_size)
         else:
             results = []
             for i in range(len(layer_ranking)):
                 layers_list = layer_ranking[:i+1]
                 logging.info(f"Evaluating with layers_list: {layers_list}")
                 cv = CVCommunicator(model_A, model_B, cfg.layer_from, cfg.layer_to, layers_list=layers_list, top_layers=cfg.top_layers, apply_attn_tracer=False, shift_back=cfg.shift_back)
-                result = communication_evaluator.test(model_A, cv, limit=cfg.limit)
+                result = communication_evaluator.test(model_A, cv, limit=cfg.limit, batch_size=cfg.batch_size)
                 results.append(result)
             logging.info(f"Layer curve results: {results}")
             if cfg.use_wandb:
