@@ -16,8 +16,10 @@ Comparison baselines (inherited from com.py):
   --do_test_baseline  Baseline (B only, no A context)
   --do_test           Regular KVComm (no latent)
 
-New flag:
+New flags:
   --do_test_latent    LatentMAS + KVComm (Mode 1 or 2 per --latent_kv_select)
+  --do_test_nld       TextMAS — natural-language baseline for LatentMAS
+                      (A generates a short text summary, B reads and refines)
 
 Usage examples:
   # Mode 1: LatentMAS standalone
@@ -38,6 +40,12 @@ Usage examples:
       --model_A meta-llama/Llama-3.2-3B-Instruct \\
       --model_B meta-llama/Llama-3.2-3B-Instruct \\
       --layers_list 14 20 25 --do_test --test_task tmath --limit 50
+
+  # TextMAS baseline (natural-language channel)
+  python com_latent.py \\
+      --model_A meta-llama/Llama-3.2-3B-Instruct \\
+      --model_B meta-llama/Llama-3.2-3B-Instruct \\
+      --do_test_nld --nld_max_tokens_A 128 --test_task hotpotqa --limit 200
 """
 
 import os
@@ -56,7 +64,7 @@ from transformers.trainer_utils import set_seed
 from models import CVCommunicator
 from models_latent import LatentMAS
 from eval import SkylineEvaluator, CommunicationEvaluator, BaselineEvaluator
-from eval_latent import LatentCommunicationEvaluator
+from eval_latent import LatentCommunicationEvaluator, TextMASEvaluator
 from utils import setup_logging, log_gpu_info, generate_run_name
 from dataloader import get_evaluator
 from layer_importance import get_top_layers, get_layer_ranking
@@ -114,11 +122,12 @@ class LatentAlignConfig:
     task_name: str = ""
     limit: int = 0
 
-    # ── What to run ───────────────────────────────────────────────────────
+    # ── What to run ────────────────────────────────────────────────────────────
     do_test_skyline: bool = False    # Skyline (A+B with full context)
     do_test_baseline: bool = False   # Baseline (B only, no A context)
     do_test: bool = False            # Regular KVComm (no latent, for comparison)
     do_test_latent: bool = False     # LatentMAS + KVComm  ← main new method
+    do_test_nld: bool = False        # TextMAS ← sequential text-channel baseline for LatentMAS
 
     # ── W&B ───────────────────────────────────────────────────────────────
     run_name: str = ""
@@ -137,6 +146,14 @@ class LatentAlignConfig:
 
 def generate_latent_run_name(cfg: LatentAlignConfig) -> str:
     """Generate a descriptive run name including latent parameters."""
+    if cfg.do_test_nld:
+        # TextMAS: build run name with "TextMAS" label (not "NLD" from utils)
+        from utils import get_model_short_name
+        model_A_short = get_model_short_name(cfg.model_A)
+        model_B_short = get_model_short_name(cfg.model_B)
+        layer_to_str = "ALL" if cfg.layer_to < 0 else cfg.layer_to
+        layer_info = f"from{cfg.layer_from}to{layer_to_str}"
+        return f"{cfg.test_task}_{model_A_short}-to-{model_B_short}_{layer_info}_TextMAS"
     base = generate_run_name(cfg)   # reuse KVComm's convention
     latent_suffix = f"_lat{cfg.latent_steps}"
     if cfg.latent_space_realign:
@@ -178,7 +195,8 @@ def main(cfg: LatentAlignConfig):
     skyline_log_path  = os.path.join(response_log_dir, "skyline_responses.jsonl")
     baseline_log_path = os.path.join(response_log_dir, "baseline_responses.jsonl")
     kvcomm_log_path   = os.path.join(response_log_dir, "kvcomm_responses.jsonl")
-    logging.info(f"Response logs will be saved to: {response_log_dir}/{{skyline|baseline|kvcomm|latent}}_responses.jsonl")
+    textmas_log_path  = os.path.join(response_log_dir, "textmas_responses.jsonl")
+    logging.info(f"Response logs will be saved to: {response_log_dir}/{{skyline|baseline|kvcomm|latent|textmas}}_responses.jsonl")
 
     # ── W&B ───────────────────────────────────────────────────────────────
     if cfg.use_wandb:
@@ -269,6 +287,23 @@ def main(cfg: LatentAlignConfig):
             shift_back=cfg.shift_back,
         )
         results = comm_evaluator.test(model_A, cv, limit=cfg.limit)
+
+    # ── TextMAS (sequential text-channel baseline, paper-faithful) ────────────
+    if cfg.do_test_nld:
+        logging.info(
+            f"Running TextMAS (sequential text-channel baseline): "
+            f"allow_b_think={cfg.allow_b_think}, max_tokens_B={cfg.max_tokens_B}"
+        )
+        textmas_evaluator = TextMASEvaluator(
+            evaluator=evaluator,
+            tokenizer=tokenizer,
+            use_wandb=cfg.use_wandb,
+            max_input_length=cfg.max_input_length,
+            allow_b_think=cfg.allow_b_think,
+            max_tokens_B=cfg.max_tokens_B,
+            response_log_path=textmas_log_path,
+        )
+        results = textmas_evaluator.test(model_A, model_B, limit=cfg.limit)
 
     # ── LatentMAS + KVComm (main new method) ──────────────────────────────
     if cfg.do_test_latent:

@@ -226,20 +226,24 @@ def build_latent_sender_msg(evaluator, item: dict, is_think: bool = False) -> st
         )
 
 
-def build_latent_receiver_msg(evaluator, item: dict) -> str:
+def build_latent_receiver_msg(evaluator, item: dict, allow_b_think: bool = False) -> str:
     """
     Build the user-role message string for receiver B with latent-awareness prefix.
 
     Imports and reuses core B templates from eval.py to stay in sync with
     the original KVComm receiver format (only the prefix changes).
 
-    For LatentMAS tasks (medqa, mbppplus, aime2024) that don’t have a split
-    prompt_A / prompt_B, B receives the full question (prompt_B) with a
-    task-specific instruction that includes the answer format.
+    For LatentMAS tasks (medqa, mbppplus, aime2024, etc.) that don’t have a split
+    prompt_A / prompt_B, B receives the full question (prompt_B) with an
+    instruction dynamically adapted based on allow_b_think:
+      - allow_b_think=True: Instructs B to reason step-by-step using the latent context.
+      - allow_b_think=False: Instructs B to directly output the answer without step-by-step
+                             reasoning to avoid conflict with suppressed CoT / assistant prefixes.
 
     Args:
         evaluator: Task evaluator (used to detect task type via hasattr flags).
         item:      Dataset item dict with "prompt_B" key.
+        allow_b_think: Whether receiver B is allowed to generate thinking tokens.
 
     Returns:
         str: LATENT_RECEIVER_PREFIX + task-specific receiver message.
@@ -258,8 +262,9 @@ def build_latent_receiver_msg(evaluator, item: dict) -> str:
 
     # ── KVComm original tasks ──────────────────────────────────────────────────
     if hasattr(evaluator, "tmath"):
+        instruction = MATH_INSTRUCTION if allow_b_think else "Directly answer the math problem with the final result."
         core = COMMUNICATION_MATH_MSG_TEMPLATE_B.format(
-            instruction=MATH_INSTRUCTION,
+            instruction=instruction,
             question=item["prompt_B"],
         )
     elif hasattr(evaluator, "repobench"):
@@ -275,10 +280,14 @@ def build_latent_receiver_msg(evaluator, item: dict) -> str:
     # ── LatentMAS tasks ───────────────────────────────────────────────────
     elif hasattr(evaluator, "medqa"):
         # B answers a medical MCQ: must output \boxed{A/B/C/D}
+        if allow_b_think:
+            inst = "Use it to reason step-by-step and select the correct answer."
+        else:
+            inst = "Based on the provided context, directly select the correct answer without any step-by-step reasoning."
         core = (
             f"You are a medical question answering assistant. "
             f"You are provided with latent context from another reasoning agent. "
-            f"Use it to reason step-by-step and select the correct answer.\n\n"
+            f"{inst}\n\n"
             f"{item['prompt_B']}\n\n"
             f"Your final answer must be selected from A, B, C, D. "
             f"For example \\boxed{{A}}. Do not add any other content inside the box."
@@ -286,10 +295,14 @@ def build_latent_receiver_msg(evaluator, item: dict) -> str:
         return LATENT_RECEIVER_PREFIX + core
     elif hasattr(evaluator, "mbppplus"):
         # B generates python code: must output ```python ... ```
+        if allow_b_think:
+            inst = "Use it to write a correct, self-contained solution."
+        else:
+            inst = "Directly provide the Python code solution without any conversational text or step-by-step explanation."
         core = (
             f"You are a Python programming assistant. "
             f"You are provided with latent context from another reasoning agent. "
-            f"Use it to write a correct, self-contained solution.\n\n"
+            f"{inst}\n\n"
             f"{item['prompt_B']}\n\n"
             f"Put all your Python code inside a markdown code block:\n"
             f"```python\nYOUR_CODE_HERE\n```\n"
@@ -298,53 +311,92 @@ def build_latent_receiver_msg(evaluator, item: dict) -> str:
         return LATENT_RECEIVER_PREFIX + core
     elif hasattr(evaluator, "aime"):
         # B solves competition math: must output \boxed{N} where N is an integer
-        core = (
-            f"You are a competition mathematics solver. "
-            f"You are provided with latent reasoning context from another agent. "
-            f"Use it to reason step-by-step and find the exact integer answer.\n\n"
-            f"{item['prompt_B']}\n\n"
-            f"Reason step by step and output the final integer answer inside "
-            f"\\boxed{{YOUR_FINAL_ANSWER}}.\n"
-            f"Now, reason step by step and output the final answer inside \\boxed{{YOUR_FINAL_ANSWER}}."
-        )
+        if allow_b_think:
+            core = (
+                f"You are a competition mathematics solver. "
+                f"You are provided with latent reasoning context from another agent. "
+                f"Use it to reason step-by-step and find the exact integer answer.\n\n"
+                f"{item['prompt_B']}\n\n"
+                f"Reason step by step and output the final integer answer inside "
+                f"\\boxed{{YOUR_FINAL_ANSWER}}.\n"
+                f"Now, reason step by step and output the final answer inside \\boxed{{YOUR_FINAL_ANSWER}}."
+            )
+        else:
+            core = (
+                f"You are a competition mathematics solver. "
+                f"You are provided with latent reasoning context from another agent. "
+                f"Based on the provided context, directly output the final integer answer without any step-by-step reasoning.\n\n"
+                f"{item['prompt_B']}\n\n"
+                f"Output only the final integer answer inside \\boxed{{YOUR_FINAL_ANSWER}}."
+            )
         return LATENT_RECEIVER_PREFIX + core
     elif hasattr(evaluator, "gsm8k"):
         # B solves a math word problem: must output \boxed{N}
-        core = (
-            f"You are a math problem solver. "
-            f"You are provided with latent reasoning context from another agent. "
-            f"Use it to reason step-by-step and find the correct numerical answer.\n\n"
-            f"{item['prompt_B']}\n\n"
-            f"Your final answer must be a number. "
-            f"Reason step by step and output the final answer inside "
-            f"\\boxed{{YOUR_FINAL_ANSWER}}.\n"
-            f"Now, reason step by step and output the final answer inside \\boxed{{YOUR_FINAL_ANSWER}}."
-        )
+        if allow_b_think:
+            core = (
+                f"You are a math problem solver. "
+                f"You are provided with latent reasoning context from another agent. "
+                f"Use it to reason step-by-step and find the correct numerical answer.\n\n"
+                f"{item['prompt_B']}\n\n"
+                f"Your final answer must be a number. "
+                f"Reason step by step and output the final answer inside "
+                f"\\boxed{{YOUR_FINAL_ANSWER}}.\n"
+                f"Now, reason step by step and output the final answer inside \\boxed{{YOUR_FINAL_ANSWER}}."
+            )
+        else:
+            core = (
+                f"You are a math problem solver. "
+                f"You are provided with latent reasoning context from another agent. "
+                f"Based on the provided context, directly output the final numerical answer without any step-by-step reasoning.\n\n"
+                f"{item['prompt_B']}\n\n"
+                f"Your final answer must be a number. Output only the final answer inside \\boxed{{YOUR_FINAL_ANSWER}}."
+            )
         return LATENT_RECEIVER_PREFIX + core
     elif hasattr(evaluator, "arc_easy") or hasattr(evaluator, "arc_challenge") or hasattr(evaluator, "gpqa"):
         # B answers a science/graduate MCQ: must output \boxed{A/B/C/D}
-        core = (
-            f"You are a question answering assistant. "
-            f"You are provided with latent context from another reasoning agent. "
-            f"Use it to reason step-by-step and select the correct answer.\n\n"
-            f"{item['prompt_B']}\n\n"
-            f"Your final answer must be selected from A, B, C, D. "
-            f"For example \\boxed{{A}}. Do not add any other content inside the box.\n"
-            f"Now, reason step by step and output the final answer inside \\boxed{{YOUR_FINAL_ANSWER}}."
-        )
+        if allow_b_think:
+            core = (
+                f"You are a question answering assistant. "
+                f"You are provided with latent context from another reasoning agent. "
+                f"Use it to reason step-by-step and select the correct answer.\n\n"
+                f"{item['prompt_B']}\n\n"
+                f"Your final answer must be selected from A, B, C, D. "
+                f"For example \\boxed{{A}}. Do not add any other content inside the box.\n"
+                f"Now, reason step by step and output the final answer inside \\boxed{{YOUR_FINAL_ANSWER}}."
+            )
+        else:
+            core = (
+                f"You are a question answering assistant. "
+                f"You are provided with latent context from another reasoning agent. "
+                f"Based on the provided context, directly select the correct answer without any step-by-step reasoning.\n\n"
+                f"{item['prompt_B']}\n\n"
+                f"Your final answer must be selected from A, B, C, D. "
+                f"For example \\boxed{{A}}. Do not add any other content inside the box."
+            )
         return LATENT_RECEIVER_PREFIX + core
     elif hasattr(evaluator, "humanevalplus"):
         # B generates Python code: must output ```python ... ```
-        core = (
-            f"You are a Python programming assistant. "
-            f"You are provided with latent context from another reasoning agent. "
-            f"Use it to write a correct, self-contained solution.\n\n"
-            f"{item['prompt_B']}\n\n"
-            f"Put all your Python code inside a markdown code block:\n"
-            f"```python\nYOUR_CODE_HERE\n```\n"
-            f"Do not add any other content inside the code block.\n"
-            f"Now, reason step by step and output the final answer inside ```python\nYOUR_PYTHON_CODE\n```."
-        )
+        if allow_b_think:
+            core = (
+                f"You are a Python programming assistant. "
+                f"You are provided with latent context from another reasoning agent. "
+                f"Use it to write a correct, self-contained solution.\n\n"
+                f"{item['prompt_B']}\n\n"
+                f"Put all your Python code inside a markdown code block:\n"
+                f"```python\nYOUR_CODE_HERE\n```\n"
+                f"Do not add any other content inside the code block.\n"
+                f"Now, reason step by step and output the final answer inside ```python\nYOUR_PYTHON_CODE\n```."
+            )
+        else:
+            core = (
+                f"You are a Python programming assistant. "
+                f"You are provided with latent context from another reasoning agent. "
+                f"Directly provide the Python code solution without any conversational text or step-by-step explanation.\n\n"
+                f"{item['prompt_B']}\n\n"
+                f"Put all your Python code inside a markdown code block:\n"
+                f"```python\nYOUR_CODE_HERE\n```\n"
+                f"Do not add any other content inside the code block."
+            )
         return LATENT_RECEIVER_PREFIX + core
     else:
         # Default: general QA
