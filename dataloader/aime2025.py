@@ -14,7 +14,7 @@ Evaluation: integer exact match.
 Notes:
   - AIME answers are integers in [0, 999].
   - Models must output final answer in \\boxed{N}.
-  - max_tokens = 4096 (competition math needs long reasoning chains).
+  - max_tokens = 20000 (paper: LatentMAS Section 4).
   - Uses self.aime = True (same flag as aime2024) since prompt logic is identical.
 
 Attributes used by prompts_latent.py:
@@ -58,7 +58,7 @@ class AIME2025Evaluator(BaseEvaluator):
 
     def __init__(self, n_samples: int = None):
         super().__init__()
-        self.max_tokens = 4096       # AIME requires long reasoning chains
+        self.max_tokens = 20000      # Paper (LatentMAS Section 4): 20000 for AIME25
         self.truncate_input = False
         self.multiple_answers = False
         self.n_samples = n_samples

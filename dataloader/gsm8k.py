@@ -14,7 +14,7 @@ Evaluation: numeric exact match (compare as int/float).
 Notes:
   - GSM8K answers are non-negative integers.
   - Models must output final answer in \\boxed{N}.
-  - max_tokens = 1024 (math word problems need reasoning chains).
+  - max_tokens = 2048 (paper: LatentMAS Section 4).
 
 Attributes used by prompts_latent.py:
   self.gsm8k = True
@@ -62,7 +62,7 @@ class GSM8KEvaluator(BaseEvaluator):
 
     def __init__(self, n_samples: int = None):
         super().__init__()
-        self.max_tokens = 1024       # Math word problems: moderate reasoning chain
+        self.max_tokens = 2048       # Paper (LatentMAS Section 4): 2048 for GSM8K
         self.truncate_input = False  # GSM8K problems are short
         self.multiple_answers = False
         self.n_samples = n_samples

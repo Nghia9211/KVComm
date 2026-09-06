@@ -12,12 +12,7 @@ Task format:
 
 Evaluation: exact match on single letter (case-insensitive after normalize).
 
-max_tokens = 512  (MCQ reasoning; enough for \\boxed{X} + brief reasoning)
-
-LatentMAS recommended override (--max_tokens_B):
-  N=10 : 2048
-  N=20 : 1536
-  N=40 : 1024
+max_tokens = 4096  (paper: LatentMAS Section 4).
 """
 
 import os
@@ -91,10 +86,7 @@ class MedQAEvaluator(BaseEvaluator):
 
     def __init__(self, n_samples: int = None):
         super().__init__()
-        self.max_tokens = 512        # MCQ: \boxed{X} + brief reasoning chain.
-                                     # 512 is the KVComm-only default; for LatentMAS with
-                                     # allow_b_think=True, override via --max_tokens_B:
-                                     #   N=10 → 2048, N=20 → 1536, N=40 → 1024
+        self.max_tokens = 4096       # Paper (LatentMAS Section 4): 4096 for MedQA
         self.truncate_input = True
         self.multiple_answers = False
         self.n_samples = n_samples   # None = use all samples

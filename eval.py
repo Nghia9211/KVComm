@@ -153,11 +153,13 @@ def apply_chat_template(evaluator, tokenizer, msg, model, context=False, allow_b
     return input_ids
 
 class SkylineEvaluator:
-    def __init__(self, evaluator, tokenizer, use_wandb, max_input_length):
+    def __init__(self, evaluator, tokenizer, use_wandb, max_input_length,
+                 response_log_path: Optional[str] = None):
         self.evaluator = evaluator
         self.tokenizer = tokenizer
         self.use_wandb = use_wandb
         self.max_input_length = max_input_length
+        self.response_log_path = response_log_path  # reserved for future logging
         self.name = "skyline"
         self.generate_args = {
             "max_new_tokens": self.evaluator.max_tokens,

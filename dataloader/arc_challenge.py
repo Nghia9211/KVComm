@@ -47,9 +47,7 @@ class ARCChallengeEvaluator(BaseEvaluator):
 
     def __init__(self, n_samples: int = None):
         super().__init__()
-        self.max_tokens = 1024      # ARC-Challenge: harder science MCQ, needs more reasoning.
-                                     # For LatentMAS allow_b_think=True, use --max_tokens_B:
-                                     #   N=10 → 2048, N=20 → 1536, N=40 → 1024
+        self.max_tokens = 2048      # Paper (LatentMAS Section 4): 2048 for ARC-Challenge
         self.truncate_input = True
         self.multiple_answers = False
         self.n_samples = n_samples

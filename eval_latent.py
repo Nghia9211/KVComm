@@ -43,13 +43,16 @@ Layer importance tracking, _test, test are inherited from parent unchanged.
        for a fair comparison. Inherits from NLDEvaluator (eval.py).
 """
 
-import torch
+import json
+import time
 import logging
+import torch
+from tqdm import tqdm
 from eval import CommunicationEvaluator, apply_chat_template, is_think_model
 from layer_importance import calc_layer_importance
 from models_latent import LatentMAS
 from models import CVCommunicator
-from prompts_latent import build_latent_sender_msg, build_latent_receiver_msg
+from prompts_latent import build_latent_sender_msg, build_latent_receiver_msg, build_text_receiver_msg
 
 
 class LatentCommunicationEvaluator(CommunicationEvaluator):
@@ -418,12 +421,10 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
         if cv is None:
             return super()._test(model_A, limit=limit, do_calc_layer_importance=do_calc_layer_importance)
 
-        import json
         items_all = list(self.evaluator)
         if limit is not None:
             items_all = items_all[:limit]
 
-        from tqdm import tqdm
         progress_bar = tqdm(range(0, len(items_all), batch_size), desc=f"{self.name} result: 0.0000", disable=do_calc_layer_importance)
 
         # ── Open response log file (mirrors CommunicationEvaluator pattern) ──
@@ -456,11 +457,8 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
 
                 for i, (item, resp) in enumerate(zip(batch_items, responses)):
                     # resp = clean answer (thinking trace stripped by get_response override)
-                    # Score before writing so we can include `correct` in the log
-                    prev_count = self.evaluator.f1_count
                     prev_total = self.evaluator.f1_total
                     self.evaluator.evaluate_item(item, resp)
-                    # Detect correctness: f1_total increased by 1.0 = correct
                     item_score = self.evaluator.f1_total - prev_total
 
                     result = self.evaluator.get_result()
@@ -490,7 +488,6 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
 
     @torch.no_grad()
     def test(self, model_A, cv, limit=None, no_wandb=False, do_calc_layer_importance=False, batch_size=1):
-        import time, logging
         tic = time.time()
         result = self._test(model_A, cv, limit=limit, do_calc_layer_importance=do_calc_layer_importance, batch_size=batch_size)
         toc = time.time()
@@ -604,15 +601,15 @@ class TextMASEvaluator:
         Build tokenised input for Agent A.
 
         Uses build_latent_sender_msg() — the same framing as LatentMAS.
-        Respects self.allow_b_think: if True, <think> is enabled; if False,
-        thinking is suppressed so A generates concise text.
+        Agent A ALWAYS has allow_b_think=True so that it generates a full reasoning CoT,
+        matching the latent thinking capability of Sender A in LatentMAS.
         """
         msg_A = build_latent_sender_msg(
             self.evaluator, item, is_think=self._is_think_model(model_A)
         )
         input_ids_A = self._apply_chat_template(
             self.evaluator, self.tokenizer, msg_A, model_A,
-            context=False, allow_b_think=self.allow_b_think,
+            context=False, allow_b_think=True,
         )
         return input_ids_A
 
@@ -621,17 +618,18 @@ class TextMASEvaluator:
         Build tokenised input for Agent B.
 
         B receives:
-          build_latent_receiver_msg()        ← same framing as LatentMAS
-          + Agent A's full reasoning text    ← sequential text communication
+          build_text_receiver_msg() with Agent A's reasoning naturally formatted
+          between role introduction and target question.
+          ← sequential natural language communication baseline.
 
         Respects self.allow_b_think for B as well.
 
         Truncation: if the combined prompt exceeds max_input_length, we
         truncate the middle (same strategy as CommunicationEvaluator).
         """
-        msg_B_base = build_latent_receiver_msg(self.evaluator, item, allow_b_think=self.allow_b_think)
-        # Append A's full output as plain context (no debate/refine framing)
-        msg_B = msg_B_base + "\n\n" + self._A_CONTEXT_PREFIX.format(response_A=response_A)
+        msg_B = build_text_receiver_msg(
+            self.evaluator, item, response_A=response_A, allow_b_think=self.allow_b_think
+        )
 
         input_ids_B = self._apply_chat_template(
             self.evaluator, self.tokenizer, msg_B, model_B,
@@ -705,9 +703,6 @@ class TextMASEvaluator:
     # ------------------------------------------------------------------
 
     def _test(self, model_A, model_B, limit=None):
-        import json
-        from tqdm import tqdm
-
         items_all = list(self.evaluator)
         if limit is not None:
             items_all = items_all[:limit]
@@ -755,7 +750,6 @@ class TextMASEvaluator:
 
     @torch.no_grad()
     def test(self, model_A, model_B, limit=None):
-        import time
         tic = time.time()
         result = self._test(model_A, model_B, limit)
         toc = time.time()

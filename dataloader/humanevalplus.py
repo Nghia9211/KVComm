@@ -13,7 +13,7 @@ Evaluation: execution-based (same pattern as mbppplus.py).
   with the test harness.
 
 Notes:
-  - max_tokens = 2048 (code generation needs space).
+  - max_tokens = 4096 (paper: LatentMAS Section 4).
   - The test harness calls check(entry_point) to validate the solution.
 
 Attributes used by prompts_latent.py:
@@ -60,7 +60,7 @@ class HumanEvalPlusEvaluator(BaseEvaluator):
 
     def __init__(self, n_samples: int = None):
         super().__init__()
-        self.max_tokens = 2048
+        self.max_tokens = 4096       # Paper (LatentMAS Section 4): 4096 for HumanEval+
         self.truncate_input = True
         self.multiple_answers = False
         self.n_samples = n_samples

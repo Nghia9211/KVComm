@@ -9,7 +9,7 @@ Task format:
   answer   = single lowercase letter: "a", "b", "c", or "d"
 
 Evaluation: exact match on single letter (case-insensitive).
-max_tokens = 512.
+max_tokens = 2048 (paper: LatentMAS Section 4).
 
 Attributes used by prompts_latent.py:
   self.arc_easy = True
@@ -68,7 +68,7 @@ class ARCEasyEvaluator(BaseEvaluator):
 
     def __init__(self, n_samples: int = None):
         super().__init__()
-        self.max_tokens = 512
+        self.max_tokens = 2048      # Paper (LatentMAS Section 4): 2048 for ARC-Easy
         self.truncate_input = True
         self.multiple_answers = False
         self.n_samples = n_samples

@@ -10,6 +10,7 @@ out_A_past_key_values → prepare_key_cache().
 """
 
 import torch
+import torch.nn.functional as F
 import logging
 from typing import Optional
 from transformers.cache_utils import DynamicCache
@@ -47,6 +48,7 @@ class LatentMAS:
         model: PreTrainedModel,
         latent_steps: int = 5,
         latent_space_realign: bool = True,
+        track_convergence: bool = False,
     ) -> None:
         """
         Args:
@@ -55,10 +57,20 @@ class LatentMAS:
             latent_space_realign: If True, project hidden state back to
                 embedding space via learned linear map W = (E_out^T E_out)^{-1} E_out^T E_in.
                 If False, only L2-normalize (identity realignment).
+            track_convergence: If True, compute and log cosine similarity between
+                consecutive hidden states h^(n) and h^(n-1) after each latent step.
+                Results are stored in self.convergence_history (reset on each run() call).
+                Adds negligible overhead (one cosine_similarity call per step).
         """
         self.model = model
         self.latent_steps = latent_steps
         self.latent_space_realign = latent_space_realign
+        # §3.2 Convergence tracking: log cosine similarity between consecutive
+        # hidden states h^(n) and h^(n-1) to observe convergence rate.
+        # No auto-stop — purely for analysis.
+        self.track_convergence = track_convergence
+        # Populated during each run() call; list of cosine similarity values.
+        self.convergence_history: list[float] = []
 
         self._realign_matrix: Optional[torch.Tensor] = None
         self._target_norm: Optional[torch.Tensor] = None
@@ -69,7 +81,8 @@ class LatentMAS:
         self._layer_devices: Optional[list] = None
         logging.info(
             f"LatentMAS initialized: latent_steps={latent_steps}, "
-            f"latent_space_realign={latent_space_realign}"
+            f"latent_space_realign={latent_space_realign}, "
+            f"track_convergence={track_convergence}"
         )
 
     # ------------------------------------------------------------------
@@ -354,6 +367,10 @@ class LatentMAS:
                 f"input_ids must be 2D [batch, seq_len], got shape {tuple(input_ids.shape)}"
             )
 
+        # Reset per-run convergence history
+        if self.track_convergence:
+            self.convergence_history = []
+
         # Resolve the input device: use the embedding layer's device so that
         # input_ids land on the first real compute device, even with
         # device_map="auto" where next(parameters()) might return "meta".
@@ -428,7 +445,21 @@ class LatentMAS:
             #                 device meta!
             # Move every layer’s K/V to the device where that layer lives.
             past        = self._normalize_cache_devices(past)
+            prev_hidden = last_hidden  # store before updating
             last_hidden = outputs.hidden_states[-1][:, -1, :]       # [B, D]
+
+            # §3.2 Convergence tracking: log cosine similarity between
+            # h^(step) (prev_hidden) and h^(step+1) (last_hidden).
+            # Cosine sim ≈ 1.0 means the latent loop has converged.
+            if self.track_convergence:
+                cos_sim = F.cosine_similarity(
+                    last_hidden.float(), prev_hidden.float(), dim=-1
+                ).mean().item()
+                self.convergence_history.append(cos_sim)
+                logging.info(
+                    f"Latent convergence [{step+1}/{self.latent_steps}]: "
+                    f"cosine_sim(h[{step}]→h[{step+1}])={cos_sim:.4f}"
+                )
 
             logging.debug(
                 f"Latent step {step + 1}/{self.latent_steps}: "

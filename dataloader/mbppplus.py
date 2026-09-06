@@ -13,7 +13,7 @@ Evaluation: execution-based.
   with the test cases. Uses run_with_timeout() from KVComm utils.
 
 Notes:
-  - max_tokens = 2048 (code generation needs enough space).
+  - max_tokens = 4096 (paper: LatentMAS Section 4).
   - evaluate_item() overrides BaseEvaluator to run code execution instead of F1.
   - The evaluator stores OK/total; get_result() returns pass@1 accuracy.
 
@@ -72,7 +72,7 @@ class MBPPPlusEvaluator(BaseEvaluator):
 
     def __init__(self, n_samples: int = None):
         super().__init__()
-        self.max_tokens = 2048       # Code generation needs space
+        self.max_tokens = 4096       # Paper (LatentMAS Section 4): 4096 for MBPP+
         self.truncate_input = True
         self.multiple_answers = False
         self.n_samples = n_samples   # None = use all test samples

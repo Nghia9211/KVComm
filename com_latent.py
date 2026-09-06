@@ -100,7 +100,7 @@ class LatentAlignConfig:
     random_selection: bool = False
     shift_back: bool = False
 
-    # ── Latent params (NEW) ───────────────────────────────────────────────
+    # ── Latent params ──────────────────────────────────────────────────────
     latent_steps: int = 5
     latent_space_realign: bool = True
     # latent_kv_select=False → Mode 1 (all layers, LatentMAS standalone)
@@ -116,6 +116,26 @@ class LatentAlignConfig:
     # Only applies to --do_test_latent (LatentMAS). Other modes are unaffected.
     max_tokens_B: int = 0
     batch_size: int = 1
+
+    # ── §3.1 Dual-Selective KV Routing ────────────────────────────────────
+    # dual_kv_select=True → Mode 4: instead of one uniform layer ranking, split A's
+    # layers into a shallow "context half" (factual retrieval, T_A tokens) and a deep
+    # "latent half" (reasoning abstraction, N tokens), select top-k% from each.
+    # Mutually exclusive with --latent_kv_select (Mode 2).
+    dual_kv_select: bool = False
+    # split_ratio: fraction of A's layers (from shallow end) reserved for the context half.
+    # E.g. 0.4 with 36 layers → layers 0–13 for context, layers 14–35 for latent.
+    split_ratio: float = 0.4
+    # context_top_ratio: fraction of context-half layers to include (1.0 = all).
+    context_top_ratio: float = 1.0
+    # latent_top_ratio: fraction of latent-half layers to include (1.0 = all).
+    latent_top_ratio: float = 1.0
+
+    # ── §3.2 Convergence Tracking ──────────────────────────────────────────
+    # If True, log cosine similarity between consecutive hidden states after each
+    # latent step: cosine_sim(h^(n), h^(n-1)). No auto-stop, purely for analysis.
+    track_convergence: bool = False
+
 
     # ── Task ──────────────────────────────────────────────────────────────
     test_task: str = "tmath"
@@ -158,9 +178,17 @@ def generate_latent_run_name(cfg: LatentAlignConfig) -> str:
     latent_suffix = f"_lat{cfg.latent_steps}"
     if cfg.latent_space_realign:
         latent_suffix += "_realign"
-    if cfg.latent_kv_select:
+    if cfg.dual_kv_select:
+        # Mode 4: Dual-Selective KV Routing
+        latent_suffix += f"_dualKV_spl{cfg.split_ratio}"
+        if cfg.context_top_ratio < 1.0:
+            latent_suffix += f"_ctx{cfg.context_top_ratio}"
+        if cfg.latent_top_ratio < 1.0:
+            latent_suffix += f"_lat{cfg.latent_top_ratio}"
+    elif cfg.latent_kv_select:
         latent_suffix += "_kvsel"
     return base + latent_suffix
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -311,6 +339,7 @@ def main(cfg: LatentAlignConfig):
             f"Running LatentMAS evaluation: "
             f"latent_steps={cfg.latent_steps}, "
             f"latent_space_realign={cfg.latent_space_realign}, "
+            f"dual_kv_select={cfg.dual_kv_select}, "
             f"latent_kv_select={cfg.latent_kv_select}, "
             f"top_layers={cfg.top_layers}, "
             f"random_selection={cfg.random_selection}"
@@ -321,15 +350,65 @@ def main(cfg: LatentAlignConfig):
             model=model_A,
             latent_steps=cfg.latent_steps,
             latent_space_realign=cfg.latent_space_realign,
+            track_convergence=cfg.track_convergence,
         )
 
+        # ── Resolve A_num_layers (shared across all modes) ────────────────
+        if hasattr(model_A.config, "num_hidden_layers"):
+            A_num_layers = model_A.config.num_hidden_layers
+        else:
+            A_num_layers = model_A.config.text_config.num_hidden_layers
+
+        # ── Validate mutual exclusion ──────────────────────────────────────
+        if cfg.dual_kv_select and cfg.latent_kv_select:
+            raise ValueError(
+                "--dual_kv_select and --latent_kv_select are mutually exclusive. "
+                "Use --dual_kv_select for Mode 4 (Dual-Selective KV Routing) or "
+                "--latent_kv_select for Mode 2 (uniform KVComm layer selection)."
+            )
+
         # ── Determine layers_list for CVCommunicator ───────────────────
-        if not cfg.latent_kv_select:
-            # Mode 1: all layers → no selection, equivalent to LatentMAS standalone
-            if hasattr(model_A.config, "num_hidden_layers"):
-                A_num_layers = model_A.config.num_hidden_layers
-            else:
-                A_num_layers = model_A.config.text_config.num_hidden_layers
+        if cfg.dual_kv_select:
+            # ── Mode 4: §3.1 Dual-Selective KV Routing ──────────────────
+            context_layers, latent_layers = CVCommunicator.get_dual_layers_list(
+                A_num_layers,
+                split_ratio=cfg.split_ratio,
+                context_top_ratio=cfg.context_top_ratio,
+                latent_top_ratio=cfg.latent_top_ratio,
+            )
+            dual_layers_list = sorted(set(context_layers) | set(latent_layers))
+            logging.info(
+                f"Mode 4 (Dual-Selective KV Routing): "
+                f"A_num_layers={A_num_layers}, split_ratio={cfg.split_ratio}, "
+                f"context_layers={context_layers} (n={len(context_layers)}), "
+                f"latent_layers={latent_layers} (n={len(latent_layers)}), "
+                f"union={dual_layers_list} (n={len(dual_layers_list)}/{A_num_layers} = "
+                f"{len(dual_layers_list)/A_num_layers*100:.0f}%)"
+            )
+
+            cv = CVCommunicator(
+                model_A, model_B,
+                cfg.layer_from, cfg.layer_to,
+                layers_list=dual_layers_list,
+                top_layers=0.0,
+                apply_attn_tracer=False,
+                shift_back=cfg.shift_back,
+            )
+            latent_evaluator = LatentCommunicationEvaluator(
+                evaluator=evaluator,
+                tokenizer=tokenizer,
+                use_wandb=cfg.use_wandb,
+                max_input_length=cfg.max_input_length,
+                latent_mas=latent_mas,
+                cv=cv,
+                latent_only=cfg.latent_only,
+                allow_b_think=cfg.allow_b_think,
+                max_tokens_B=cfg.max_tokens_B,
+                response_log_path=response_log_path,
+            )
+            results = latent_evaluator.test(model_A, cv, limit=cfg.limit, batch_size=cfg.batch_size)
+
+        elif not cfg.latent_kv_select:
             latent_layers_list = list(range(A_num_layers))
             if cfg.top_layers > 0:
                 logging.warning(

@@ -1,4 +1,5 @@
 from typing import Literal, Optional
+import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -73,6 +74,79 @@ class CVCommunicator(PreTrainedModel, GenerationMixin):
             self.apply_B_attn_tracer()
 
         logging.info(f"CVCommunicator initialized")
+
+    @staticmethod
+    def get_dual_layers_list(
+        A_num_layers: int,
+        split_ratio: float = 0.4,
+        context_top_ratio: float = 1.0,
+        latent_top_ratio: float = 1.0,
+    ) -> tuple[list[int], list[int]]:
+        """
+        Partition A's layers into context-optimized (shallow) and latent-optimized (deep)
+        groups for §3.1 Dual-Selective KV Routing.
+
+        Instead of ranking all layers by a single importance score (Mode 2), we split
+        the depth axis into two halves and select independently from each:
+
+          - **Context half** [0, split_point):  shallow–mid layers that preserve
+            factual/verbatim representations from T_A input tokens.
+            Fixing MultiFieldQA-EN regression caused by latent thinking distorting
+            extraction context (Finding F2 / Problem P1 in problem_v1.md).
+
+          - **Latent half** [split_point, L):   mid–deep layers that encode reasoning
+            abstractions built during the N latent thinking steps.
+            Preserving the reasoning capability that makes LatentMAS win on HotpotQA/TMATH.
+
+        The caller should union both returned lists and pass to CVCommunicator as
+        `layers_list`:
+            context_l, latent_l = CVCommunicator.get_dual_layers_list(L, ...)
+            layers_list = sorted(set(context_l) | set(latent_l))
+            cv = CVCommunicator(..., layers_list=layers_list, ...)
+
+        Args:
+            A_num_layers:       Total number of transformer layers in model A.
+            split_ratio:        Fraction of layers (from shallow end) reserved for the
+                                context group.  E.g. 0.4 with 36 layers → context covers
+                                layers 0–13, latent covers 14–35.  Default 0.4.
+            context_top_ratio:  Fraction of context-half layers to include (1.0 = all).
+                                Layers are taken from the *shallowest* end of the
+                                context half (first n_ctx layers of [0, split_point)).
+            latent_top_ratio:   Fraction of latent-half layers to include (1.0 = all).
+                                Layers are taken from the *deepest* end of the latent
+                                half (last n_lat layers of [split_point, L)).
+
+        Returns:
+            (context_layers, latent_layers): Two lists of integer layer indices.
+            Indices may overlap (a layer in both lists is always transferred in full).
+        """
+        if A_num_layers < 2:
+            raise ValueError(f"A_num_layers must be >= 2, got {A_num_layers}")
+
+        split_point = round(split_ratio * A_num_layers)
+        split_point = max(1, min(split_point, A_num_layers - 1))  # clamp to valid range
+
+        # ── Context half: shallow layers [0, split_point) ─────────────────
+        context_half = list(range(0, split_point))
+        n_ctx = max(1, round(context_top_ratio * len(context_half)))
+        # Keep the first n_ctx layers (shallowest end of context half)
+        context_layers = context_half[:n_ctx]
+
+        # ── Latent half: deep layers [split_point, A_num_layers) ──────────
+        latent_half = list(range(split_point, A_num_layers))
+        n_lat = max(1, round(latent_top_ratio * len(latent_half)))
+        # Keep the last n_lat layers (deepest end of latent half)
+        latent_layers = latent_half[-n_lat:]
+
+        logging.debug(
+            f"get_dual_layers_list: A_num_layers={A_num_layers}, "
+            f"split_ratio={split_ratio} → split_point={split_point}, "
+            f"context_layers={context_layers} (n={len(context_layers)}), "
+            f"latent_layers={latent_layers} (n={len(latent_layers)})"
+        )
+        return context_layers, latent_layers
+
+
 
     def apply_B_attn_tracer(self):
         if hasattr(self.B.model, "language_model"):
@@ -260,7 +334,6 @@ def sdpa_attention_forward_without_value(
 
     return attn_weights
 
-import copy
 def get_short_past_key_values(past_key_values: DynamicCache):
     lengths = set()
     for idx in range(len(past_key_values.key_cache)):
@@ -336,15 +409,6 @@ def forward_shift_back_llama(
         past_key_values=short_past_key_values,
         position_ids=short_position_ids,
     )
-    ##########
-    # print("short_length:", short_length)
-    # # print("causal_mask shape:", causal_mask.shape)
-    # # print("short_causal_mask shape:", short_causal_mask.shape)
-    # print("position_ids:", position_ids)
-    # print("short_position_ids:", short_position_ids)
-    # print("cache_position:", cache_position)
-    # print("short_cache_position:", short_cache_position)
-
     hidden_states = inputs_embeds
 
     # create position embeddings to be shared across the decoder layers
@@ -386,11 +450,7 @@ def forward_shift_back_llama(
 
     all_hidden_states += (hidden_states,)
 
-    # Causal LM
-    logits_to_keep = 0
-    slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-    logits = model.lm_head(hidden_states[:, slice_indices, :])
-
+    logits = model.lm_head(hidden_states)
 
     return CausalLMOutputWithPast(
         logits=logits,
@@ -471,15 +531,6 @@ def forward_shift_back_qwen2(
         }
         if model.model.has_sliding_layers:
             short_causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
-    ##########
-    # print("short_length:", short_length)
-    # # print("causal_mask shape:", causal_mask.shape)
-    # # print("short_causal_mask shape:", short_causal_mask.shape)
-    # print("position_ids:", position_ids)
-    # print("short_position_ids:", short_position_ids)
-    # print("cache_position:", cache_position)
-    # print("short_cache_position:", short_cache_position)
-
     hidden_states = inputs_embeds
 
     # create position embeddings to be shared across the decoder layers
@@ -521,10 +572,7 @@ def forward_shift_back_qwen2(
 
     all_hidden_states += (hidden_states,)
 
-    # Causal LM
-    logits_to_keep = 0
-    slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-    logits = model.lm_head(hidden_states[:, slice_indices, :])
+    logits = model.lm_head(hidden_states)
 
 
     return CausalLMOutputWithPast(
