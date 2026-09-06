@@ -326,3 +326,29 @@ f1_match = True  (score 1.0)  if word-overlap F1 > 0.5
 ```
 
 Words are lowercased, punctuation-stripped, and lemmatized before comparison.
+## Evaluation protocol v2 (two-agent adaptation)
+
+New runs use explicit evaluator metadata instead of task-flag fallbacks. This is
+a two-agent Planner/Evidence-Extractor -> Solver adaptation; it is not the
+official four-agent LatentMAS chain.
+
+- LatentMAS shared-problem tasks: `gsm8k`, `aime2024`, `aime2025`, `arc_easy`,
+  `arc_challenge`, `gpqa`, `medqa`, `mbppplus`, and `humanevalplus`.
+- Query-aware KVComm QA v2: `hotpotqa`, `multifieldqa_en`, `2wikimqa`,
+  `musique`, `qasper`, `tipsheets`, and `countries`. Agent A sees both context
+  and target question and extracts evidence.
+- Native-split KVComm tasks: `tmath` (hint/problem), `repobench`
+  (code-context/completion), and `samsum` (dialogue halves).
+
+TextMAS has independent sender and receiver budgets:
+
+```bash
+python com_latent.py --do_test_nld --test_task multifieldqa_en --limit 10 \
+  --max_tokens_A 256 --max_tokens_B 64
+```
+
+For LongBench English QA tasks, schema-v2 logs report continuous
+`longbench_f1` as the primary metric and preserve the old thresholded score as
+`legacy_accuracy`. Historical prompt-v1/metric-v1 percentages are not directly
+comparable because Agent A did not see the target question and the reported
+number was threshold accuracy rather than mean F1.

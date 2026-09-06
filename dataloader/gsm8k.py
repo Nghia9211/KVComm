@@ -68,6 +68,7 @@ class GSM8KEvaluator(BaseEvaluator):
         self.n_samples = n_samples
         self.gsm8k = True            # task-detection flag for prompts_latent.py
         self.name = "gsm8k"
+        self.configure_task_profile(prompt_family="latentmas", task_type="math", sender_input_mode="shared_problem", answer_format="boxed_integer", prompt_version="latentmas_two_agent_v1", primary_metric="legacy_match", sender_max_tokens=1024)
         self.data = self.load_data()
 
     def load_data(self):

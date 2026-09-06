@@ -66,6 +66,7 @@ class HumanEvalPlusEvaluator(BaseEvaluator):
         self.n_samples = n_samples
         self.humanevalplus = True    # task-detection flag for prompts_latent.py
         self.name = "humanevalplus"
+        self.configure_task_profile(prompt_family="latentmas", task_type="code", sender_input_mode="shared_problem", answer_format="python", prompt_version="latentmas_two_agent_v1", primary_metric="legacy_match", sender_max_tokens=4096)
         self.data = self.load_data()
         self._exec_timeout = 10
 

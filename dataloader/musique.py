@@ -23,6 +23,7 @@ class MuSiQueEvaluator(BaseEvaluator):
         else:
             self.data = self.load_data_single_sender()
         self.name = "musique"
+        self.configure_task_profile(prompt_family="kvcomm", task_type="qa", sender_input_mode="query_aware_context", answer_format="short_text", prompt_version="kvcomm_qa_query_aware_v2", primary_metric="longbench_qa_f1", sender_max_tokens=256)
         self.multi_agent = multi_agent
         
     def load_data_single_sender(self):

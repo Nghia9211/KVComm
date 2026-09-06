@@ -19,6 +19,7 @@ class TMathEvaluator(BaseEvaluator):
         self.rouge = Rouge()
         self.tmath = True
         self.name = "tmath"
+        self.configure_task_profile(prompt_family="kvcomm", task_type="math", sender_input_mode="native_split", answer_format="boxed_integer", prompt_version="kvcomm_native_split_v1", primary_metric="legacy_match", sender_max_tokens=512)
         
     def load_data(self):
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -50,8 +51,3 @@ class TMathEvaluator(BaseEvaluator):
             rouge_score = max(rouge_score, scores["rouge-l"]["r"])
         self.f1_total += rouge_score
         self.f1_count += 1
-
-
-
-
-    

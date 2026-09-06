@@ -59,3 +59,16 @@ Automatically detect task type and route:
   1. Dual-selective routing matches or beats Mode 1 accuracy on reasoning tasks while recovering plain-KVComm accuracy on MultiFieldQA-EN, at ≤ 50% of Mode 1's transferred KV size.
   2. Early exit reduces latent-variant runtime ≥ 40% with no accuracy loss.
   3. Garbage-response rate < 0.5% on distilled models at any step count.
+## Reproducibility update: prompt and metric v2
+
+The comparison now separates task semantics from communication modality. All
+three methods use the same sender/receiver cores: query-aware evidence
+extraction for KVComm QA, shared-problem Planner/Solver for the nine LatentMAS
+benchmarks, and native splits for TMATH, RepoBench, and SAMSum. TextMAS alone
+inserts decoded text; latent methods transfer internal KV state. This is a
+two-agent adaptation, not the official four-agent chain.
+
+New QA runs log continuous LongBench F1 plus `legacy_accuracy`, independent A/B
+budgets, actual generated token counts, formatted prompts, and prompt/metric
+versions in schema-v2 JSONL. Context-only QA prompt-v1 runs remain immutable and
+must not be presented as directly comparable to query-aware prompt-v2 runs.

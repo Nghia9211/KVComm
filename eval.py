@@ -8,6 +8,7 @@ from layer_importance import calc_layer_importance
 from collections import defaultdict
 import time
 from typing import Optional
+from utils.response_logging import build_response_record
 
 QA_INSTRUCTION = "Directly answer the question based on the context passage, no explanation is needed."
 MATH_INSTRUCTION = "Answer the math problem step by step."
@@ -303,6 +304,15 @@ class CommunicationEvaluator(SkylineEvaluator):
         return input_ids_A, input_ids_B
 
     def prepare_input_ids(self, item, model_A, model_B):
+        from prompts_latent import build_sender_core, build_receiver_core
+        msg_A = build_sender_core(self.evaluator, item, is_think=is_think_model(model_A))
+        msg_B = build_receiver_core(self.evaluator, item, allow_b_think=self.allow_b_think)
+        input_ids_A = apply_chat_template(self.evaluator, self.tokenizer, msg_A, model_A, context=True)
+        input_ids_B = apply_chat_template(self.evaluator, self.tokenizer, msg_B, model_B, allow_b_think=self.allow_b_think)
+        return self.truncate_input(input_ids_A, input_ids_B)
+
+    def _prepare_input_ids_legacy(self, item, model_A, model_B):
+        """Historical prompt builder retained temporarily for artifact comparison."""
         # ── Sender A ──────────────────────────────────────────────────────────
         # KVComm original tasks (prompt_A != prompt_B)
         if hasattr(self.evaluator, "tmath"):
@@ -461,25 +471,26 @@ class CommunicationEvaluator(SkylineEvaluator):
                     self.layer_importance_total = calc_layer_importance(cv.B_attn_weights, model_A.name, self.layer_importance_total)
 
                 for i, (item, response) in enumerate(zip(batch_items, responses)):
-                    prev_total = self.evaluator.f1_total
-                    self.evaluator.evaluate_item(item, response)
-                    item_score = self.evaluator.f1_total - prev_total
+                    item_metrics = self.evaluator.evaluate_item(item, response) or {}
 
                     result = self.evaluator.get_result()
-                    progress_bar.set_description(f"{self.name} result: {result:.4f}")
+                    progress_bar.set_description(f"{self.name} {self.evaluator.primary_metric}: {result:.4f}")
 
                     # Write response log entry
                     if response_log_file is not None:
-                        record = {
-                            "idx":           start_idx + i,
-                            "mode":          self.name,
-                            "prompt_a":      item.get("prompt_A", ""),
-                            "prompt_b":      item.get("prompt_B", ""),
-                            "response":      response,
-                            "answer":        item.get("answer", ""),
-                            "item_score":    round(item_score, 4),
-                            "result_so_far": round(result, 4),
-                        }
+                        logged_ids_a, logged_ids_b = self.prepare_input_ids(item, cv.A, cv.B)
+                        selected_layers = list(cv.layers_list) if cv.layers_list is not None else None
+                        record = build_response_record(
+                            idx=start_idx + i, evaluator=self.evaluator, item=item,
+                            method="kvcomm", response=response,
+                            model_a_prompt=self.tokenizer.decode(logged_ids_a[0], skip_special_tokens=False),
+                            model_b_prompt=self.tokenizer.decode(logged_ids_b[0], skip_special_tokens=False),
+                            item_metrics=item_metrics, aggregate_metrics=self.evaluator.get_results(),
+                            max_tokens_b=self.generate_args["max_new_tokens"],
+                            generated_tokens_b=len(self.tokenizer.encode(response, add_special_tokens=False)),
+                            communication_type="kv_cache", layer_selection_mode="selected",
+                            selected_layers=selected_layers,
+                        )
                         response_log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
                         response_log_file.flush()
         finally:
@@ -496,7 +507,8 @@ class CommunicationEvaluator(SkylineEvaluator):
         toc = time.time()
         time_used = toc - tic
         if self.use_wandb and not no_wandb and not do_calc_layer_importance:
-            wandb.log({f"{self.name}_result": result, f"{self.name}_time": time_used})
+            wandb.log({f"{self.name}_{key}": value for key, value in self.evaluator.get_results().items() if isinstance(value, (int, float))})
+            wandb.log({f"{self.name}_time": time_used})
         logging.info(f"{self.name} result: {result:.4f}, {self.name} time: {time_used:.2f}s")
         return result
 

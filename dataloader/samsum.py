@@ -19,6 +19,7 @@ class SAMSumEvaluator(BaseEvaluator):
         self.data = self.load_data()
         self.name = "samsum"
         self.sasum = True
+        self.configure_task_profile(prompt_family="kvcomm", task_type="summarization", sender_input_mode="native_split", answer_format="summary", prompt_version="kvcomm_native_split_v1", primary_metric="legacy_match", sender_max_tokens=512)
         self.rouge = Rouge()
         
     def load_data(self):

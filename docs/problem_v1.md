@@ -113,3 +113,11 @@ A claim that Mode 1 prefill is catastrophically misaligned (`cache_position` sta
 5. Delete or rewrite the `latent_only` / `_seen_tokens` path (N1, N3) — broken *and* silently ignored, which invalidates it as an ablation.
 
 **Implication for the problem statements above**: P2 (latent drift) is partly *measurement artifact* — B1/B2 inflate the apparent drift; the true intrinsic decay curve is unknown until they are fixed. P5 (RoPE mismatch) is worse than documented: both claimed mitigations (N1, N2) are ineffective, and F4's Mode 1 > Mode 2 gap may be partly explained by B4 rather than by information loss from layer pruning.
+## Protocol-version note
+
+Historical results in this document are prompt-v1/metric-v1 artifacts. In that
+protocol, KVComm QA senders saw context without the target question and the
+reported "F1" was actually accuracy after thresholding per-item F1 at 0.5.
+Protocol v2 is query-aware and reports continuous LongBench F1, so direct
+numeric comparison requires explicitly naming both the prompt and metric
+versions. The implementation remains a two-agent adaptation.

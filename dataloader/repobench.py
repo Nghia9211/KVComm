@@ -102,6 +102,7 @@ class RepoBenchEvaluator(BaseEvaluator):
         self.data = self.load_data()
         self.repobench = True
         self.name = "repobench"
+        self.configure_task_profile(prompt_family="kvcomm", task_type="code", sender_input_mode="native_split", answer_format="python", prompt_version="kvcomm_native_split_v1", primary_metric="legacy_match", sender_max_tokens=256)
         
     def load_data(self):
         dataset = load_dataset("tianyang/repobench_python_v1.1", split="cross_file_first")

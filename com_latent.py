@@ -45,7 +45,7 @@ Usage examples:
   python com_latent.py \\
       --model_A meta-llama/Llama-3.2-3B-Instruct \\
       --model_B meta-llama/Llama-3.2-3B-Instruct \\
-      --do_test_nld --nld_max_tokens_A 128 --test_task hotpotqa --limit 200
+      --do_test_nld --max_tokens_A 256 --max_tokens_B 64 --test_task hotpotqa --limit 10
 """
 
 import os
@@ -55,6 +55,8 @@ import wandb
 import datetime
 import logging
 import random
+import json
+import hashlib
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Literal
@@ -63,11 +65,12 @@ from transformers.trainer_utils import set_seed
 
 from models import CVCommunicator
 from models_latent import LatentMAS
-from eval import SkylineEvaluator, CommunicationEvaluator, BaselineEvaluator
+from eval import SkylineEvaluator, CommunicationEvaluator, BaselineEvaluator, is_think_model
 from eval_latent import LatentCommunicationEvaluator, TextMASEvaluator
 from utils import setup_logging, log_gpu_info, generate_run_name
 from dataloader import get_evaluator
 from layer_importance import get_top_layers, get_layer_ranking
+from prompts_latent import build_sender_core, build_receiver_core
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -110,6 +113,8 @@ class LatentAlignConfig:
     # latent_only=True  → B receives only the N_latent compressed thought tokens
     latent_only: bool = False
     allow_b_think: bool = False
+    # TextMAS sender budget. 0 means evaluator.sender_max_tokens.
+    max_tokens_A: int = 0
     # max_tokens_B=0 → use evaluator's default (task-specific).
     # Set > 0 to grant B extra output headroom, e.g. 4096 when allow_b_think=True
     # so the model can reason inside <think>…</think> before giving the final answer.
@@ -173,7 +178,7 @@ def generate_latent_run_name(cfg: LatentAlignConfig) -> str:
         model_B_short = get_model_short_name(cfg.model_B)
         layer_to_str = "ALL" if cfg.layer_to < 0 else cfg.layer_to
         layer_info = f"from{cfg.layer_from}to{layer_to_str}"
-        return f"{cfg.test_task}_{model_A_short}-to-{model_B_short}_{layer_info}_TextMAS"
+        return f"{cfg.test_task}_{model_A_short}-to-{model_B_short}_{layer_info}_TextMAS_pv2_mv2_A{cfg.max_tokens_A}_B{cfg.max_tokens_B}"
     base = generate_run_name(cfg)   # reuse KVComm's convention
     latent_suffix = f"_lat{cfg.latent_steps}"
     if cfg.latent_space_realign:
@@ -187,6 +192,7 @@ def generate_latent_run_name(cfg: LatentAlignConfig) -> str:
             latent_suffix += f"_lat{cfg.latent_top_ratio}"
     elif cfg.latent_kv_select:
         latent_suffix += "_kvsel"
+    latent_suffix += f"_pv2_mv2_B{cfg.max_tokens_B}"
     return base + latent_suffix
 
 
@@ -199,7 +205,7 @@ def main(cfg: LatentAlignConfig):
     set_seed(cfg.seed)
     os.makedirs(cfg.snapshot_path, exist_ok=True)
 
-    timestamp = datetime.datetime.now().strftime("%m%d_%H%M")
+    timestamp = datetime.datetime.now().strftime("%m%d_%H%M%S")
     if cfg.run_name == "":
         run_name = generate_latent_run_name(cfg)
     else:
@@ -276,6 +282,37 @@ def main(cfg: LatentAlignConfig):
         torch._dynamo.config.cache_size_limit = 64
 
     evaluator = get_evaluator(cfg.test_task)
+    first_item = evaluator.data[0] if len(evaluator) else None
+    sender_core = build_sender_core(evaluator, first_item, is_think=is_think_model(model_A)) if first_item else ""
+    receiver_core = build_receiver_core(evaluator, first_item, allow_b_think=cfg.allow_b_think) if first_item else ""
+    effective_a_budget = cfg.max_tokens_A if cfg.max_tokens_A > 0 else evaluator.sender_max_tokens
+    effective_b_budget = cfg.max_tokens_B if cfg.max_tokens_B > 0 else evaluator.max_tokens
+    manifest = {
+        "schema_version": "v2",
+        "metric_version": "v2",
+        "task": cfg.test_task,
+        "prompt_family": evaluator.prompt_family,
+        "prompt_version": evaluator.prompt_version,
+        "sender_input_mode": evaluator.sender_input_mode,
+        "primary_metric": evaluator.primary_metric,
+        "method": "textmas" if cfg.do_test_nld else "latent_selective" if cfg.latent_kv_select else "latent_full",
+        "seed": cfg.seed,
+        "limit": cfg.limit,
+        "model_A": cfg.model_A,
+        "model_B": cfg.model_B,
+        "max_tokens_A": effective_a_budget,
+        "max_tokens_B": effective_b_budget,
+        "latent_steps": cfg.latent_steps,
+        "selected_layers": cfg.layers_list,
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "do_sample": True,
+        "first_sender_core_sha256": hashlib.sha256(sender_core.encode("utf-8")).hexdigest(),
+        "first_receiver_core_sha256": hashlib.sha256(receiver_core.encode("utf-8")).hexdigest(),
+    }
+    with open(os.path.join(final_snapshot_path, "manifest.json"), "w", encoding="utf-8") as manifest_file:
+        json.dump(manifest, manifest_file, ensure_ascii=False, indent=2)
+    logging.info(f"Evaluation profile: {manifest}")
     if cfg.limit == 0:
         cfg.limit = None
 
@@ -320,7 +357,8 @@ def main(cfg: LatentAlignConfig):
     if cfg.do_test_nld:
         logging.info(
             f"Running TextMAS (sequential text-channel baseline): "
-            f"allow_b_think={cfg.allow_b_think}, max_tokens_B={cfg.max_tokens_B}"
+            f"prompt_family={evaluator.prompt_family}, prompt_version={evaluator.prompt_version}, "
+            f"allow_b_think={cfg.allow_b_think}, max_tokens_A={cfg.max_tokens_A}, max_tokens_B={cfg.max_tokens_B}"
         )
         textmas_evaluator = TextMASEvaluator(
             evaluator=evaluator,
@@ -328,6 +366,7 @@ def main(cfg: LatentAlignConfig):
             use_wandb=cfg.use_wandb,
             max_input_length=cfg.max_input_length,
             allow_b_think=cfg.allow_b_think,
+            max_tokens_A=cfg.max_tokens_A,
             max_tokens_B=cfg.max_tokens_B,
             response_log_path=textmas_log_path,
         )

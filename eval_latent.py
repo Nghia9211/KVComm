@@ -53,6 +53,8 @@ from layer_importance import calc_layer_importance
 from models_latent import LatentMAS
 from models import CVCommunicator
 from prompts_latent import build_latent_sender_msg, build_latent_receiver_msg, build_text_receiver_msg
+from utils.response_logging import build_response_record
+from utils.evaluation_config import resolve_textmas_budgets
 
 
 class LatentCommunicationEvaluator(CommunicationEvaluator):
@@ -457,25 +459,31 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
 
                 for i, (item, resp) in enumerate(zip(batch_items, responses)):
                     # resp = clean answer (thinking trace stripped by get_response override)
-                    prev_total = self.evaluator.f1_total
-                    self.evaluator.evaluate_item(item, resp)
-                    item_score = self.evaluator.f1_total - prev_total
+                    item_metrics = self.evaluator.evaluate_item(item, resp) or {}
 
                     result = self.evaluator.get_result()
-                    progress_bar.set_description(f"{self.name} result: {result:.4f}")
+                    progress_bar.set_description(f"{self.name} {self.evaluator.primary_metric}: {result:.4f}")
 
                     # ── Write to responses.jsonl ────────────────────────────
                     if response_log_file is not None:
-                        record = {
-                            "idx":            start_idx + i,
-                            "mode":           _mode_tag,
-                            "prompt_a":       item.get("prompt_A", ""),
-                            "prompt_b":       item.get("prompt_B", ""),
-                            "response":       resp,          # clean answer (post-</think>)
-                            "answer":         item.get("answer", ""),
-                            "item_score":     round(item_score, 4),
-                            "result_so_far":  round(result, 4),
-                        }
+                        logged_ids_a, logged_ids_b = self.prepare_input_ids(item, cv.A, cv.B)
+                        selected_layers = list(cv.layers_list) if cv.layers_list is not None else None
+                        total_layers = getattr(cv.A.config, "num_hidden_layers", None)
+                        is_selective = bool(selected_layers) and total_layers is not None and len(selected_layers) < total_layers
+                        record = build_response_record(
+                            idx=start_idx + i, evaluator=self.evaluator, item=item,
+                            method="latentmas_selective_kv" if is_selective else "latentmas_full_kv",
+                            response=resp,
+                            model_a_prompt=self.tokenizer.decode(logged_ids_a[0], skip_special_tokens=False),
+                            model_b_prompt=self.tokenizer.decode(logged_ids_b[0], skip_special_tokens=False),
+                            item_metrics=item_metrics, aggregate_metrics=self.evaluator.get_results(),
+                            max_tokens_b=self.generate_args["max_new_tokens"],
+                            generated_tokens_a=self.latent_mas.latent_steps,
+                            generated_tokens_b=len(self.tokenizer.encode(resp, add_special_tokens=False)),
+                            communication_type="latent_kv", latent_steps=self.latent_mas.latent_steps,
+                            layer_selection_mode="selected" if is_selective else "full",
+                            selected_layers=selected_layers,
+                        )
                         response_log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
                         response_log_file.flush()
 
@@ -495,7 +503,8 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
 
         if self.use_wandb and not no_wandb and not do_calc_layer_importance:
             import wandb
-            wandb.log({f"{self.name}_result": result, f"{self.name}_time": time_used})
+            wandb.log({f"{self.name}_{key}": value for key, value in self.evaluator.get_results().items() if isinstance(value, (int, float))})
+            wandb.log({f"{self.name}_time": time_used})
         logging.info(f"{self.name} result: {result:.4f}, {self.name} time: {time_used:.2f}s")
         return result
 
@@ -557,6 +566,7 @@ class TextMASEvaluator:
         use_wandb: bool,
         max_input_length: int,
         allow_b_think: bool = False,
+        max_tokens_A: int = 0,
         max_tokens_B: int = 0,
         response_log_path: str = None,
     ):
@@ -572,23 +582,26 @@ class TextMASEvaluator:
         self.response_log_path = response_log_path
         self.name = "textmas"
 
-        effective_max_tokens = max_tokens_B if max_tokens_B > 0 else evaluator.max_tokens
+        self.effective_max_tokens_A, self.effective_max_tokens_B = resolve_textmas_budgets(
+            evaluator, max_tokens_A, max_tokens_B
+        )
 
-        # Both A and B use the effective token budget.
         # Sampling params aligned with LatentMAS paper (Section 4):
         # temperature=0.6, top_p=0.95 — same as LatentCommunicationEvaluator.
-        self.generate_args = {
-            "max_new_tokens": effective_max_tokens,
+        common_generate_args = {
             "temperature":    0.6,
             "top_p":          0.95,
             "top_k":          None,
             "num_beams":      1,
             "do_sample":      True,
         }
+        self.generate_args_A = {**common_generate_args, "max_new_tokens": self.effective_max_tokens_A}
+        self.generate_args_B = {**common_generate_args, "max_new_tokens": self.effective_max_tokens_B}
 
         logging.info(
             f"TextMASEvaluator ready: "
-            f"max_new_tokens={effective_max_tokens}, "
+            f"prompt_family={evaluator.prompt_family}, prompt_version={evaluator.prompt_version}, "
+            f"max_tokens_A={self.effective_max_tokens_A}, max_tokens_B={self.effective_max_tokens_B}, "
             f"allow_b_think={allow_b_think}, temperature=0.6, top_p=0.95"
         )
 
@@ -684,19 +697,28 @@ class TextMASEvaluator:
         output_A = model_A.generate(
             input_ids_A,
             attention_mask=torch.ones_like(input_ids_A),
-            **self.generate_args,
+            **self.generate_args_A,
         )[0]
-        response_A = self.get_response(output_A, input_ids_A.shape[-1])
+        response_A = self.tokenizer.decode(
+            output_A[input_ids_A.shape[-1]:], skip_special_tokens=True
+        ).strip()
 
         # ── Step 2: B generates final answer with A's full output ──────────
         input_ids_B = self._prepare_input_ids_B(item, response_A, model_B)
         output_B = model_B.generate(
             input_ids_B,
             attention_mask=torch.ones_like(input_ids_B),
-            **self.generate_args,
+            **self.generate_args_B,
         )[0]
         response_B = self.get_response(output_B, input_ids_B.shape[-1])
-        return response_B
+        return {
+            "response_A": response_A,
+            "response_B": response_B,
+            "generated_tokens_A": int(output_A.shape[-1] - input_ids_A.shape[-1]),
+            "generated_tokens_B": int(output_B.shape[-1] - input_ids_B.shape[-1]),
+            "model_A_prompt": self.tokenizer.decode(input_ids_A[0], skip_special_tokens=False),
+            "model_B_prompt": self.tokenizer.decode(input_ids_B[0], skip_special_tokens=False),
+        }
 
     # ------------------------------------------------------------------
     # Evaluation loop
@@ -716,29 +738,29 @@ class TextMASEvaluator:
         try:
             for i, item in enumerate(progress_bar):
                 try:
-                    response = self.inference(model_A, model_B, item)
+                    inference_result = self.inference(model_A, model_B, item)
                 except Exception as e:
                     logging.error(f"TextMAS inference error at item {i}: {e}")
                     continue
 
-                prev_total = self.evaluator.f1_total
-                self.evaluator.evaluate_item(item, response)
-                item_score = self.evaluator.f1_total - prev_total
+                response = inference_result["response_B"]
+                item_metrics = self.evaluator.evaluate_item(item, response) or {}
 
                 result = self.evaluator.get_result()
-                progress_bar.set_description(f"{self.name} result: {result:.4f}")
+                progress_bar.set_description(f"{self.name} {self.evaluator.primary_metric}: {result:.4f}")
 
                 if response_log_file is not None:
-                    record = {
-                        "idx":           i,
-                        "mode":          "textmas|sequential|thinking=True",
-                        "prompt_a":      item.get("prompt_A", ""),
-                        "prompt_b":      item.get("prompt_B", ""),
-                        "response":      response,
-                        "answer":        item.get("answer", ""),
-                        "item_score":    round(item_score, 4),
-                        "result_so_far": round(result, 4),
-                    }
+                    record = build_response_record(
+                        idx=i, evaluator=self.evaluator, item=item, method="textmas_two_agent",
+                        response=response, response_a=inference_result["response_A"],
+                        model_a_prompt=inference_result["model_A_prompt"],
+                        model_b_prompt=inference_result["model_B_prompt"],
+                        item_metrics=item_metrics, aggregate_metrics=self.evaluator.get_results(),
+                        max_tokens_a=self.effective_max_tokens_A, max_tokens_b=self.effective_max_tokens_B,
+                        generated_tokens_a=inference_result["generated_tokens_A"],
+                        generated_tokens_b=inference_result["generated_tokens_B"],
+                        communication_type="text",
+                    )
                     response_log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
                     response_log_file.flush()
 
@@ -756,7 +778,8 @@ class TextMASEvaluator:
         time_used = toc - tic
         if self.use_wandb:
             import wandb
-            wandb.log({f"{self.name}_result": result, f"{self.name}_time": time_used})
+            wandb.log({f"{self.name}_{key}": value for key, value in self.evaluator.get_results().items() if isinstance(value, (int, float))})
+            wandb.log({f"{self.name}_time": time_used})
         logging.info(f"{self.name} result: {result:.4f}, {self.name} time: {time_used:.2f}s")
         return result
 

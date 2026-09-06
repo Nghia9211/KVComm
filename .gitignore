@@ -215,6 +215,7 @@ test/
 notebooks/
 slurms*/
 *.sh
+!sweep_latent.sh
 *.slurm
 *.pdf
 *.out

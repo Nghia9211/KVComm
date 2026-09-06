@@ -68,6 +68,7 @@ class AIME2024Evaluator(BaseEvaluator):
         self.n_samples = n_samples   # None = use all 30 samples
         self.aime = True             # task-detection flag for prompts_latent.py
         self.name = "aime2024"
+        self.configure_task_profile(prompt_family="latentmas", task_type="math", sender_input_mode="shared_problem", answer_format="boxed_integer", prompt_version="latentmas_two_agent_v1", primary_metric="legacy_match", sender_max_tokens=2048)
         self.data = self.load_data()
 
     def load_data(self):

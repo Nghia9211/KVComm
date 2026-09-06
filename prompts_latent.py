@@ -1,292 +1,129 @@
-"""
-prompts_latent.py — Role-based prompt templates for KVComm + LatentMAS
+"""Deterministic, modality-independent prompt routing for two-agent evaluation."""
 
-Intentionally SEPARATE from eval.py (original KVComm prompts).
-No original KVComm template is modified here.
-
-Prompt design based on LatentMAS paper (arXiv:2511.20639, Appendix K):
-  - Sequential MAS: Planner → Critic → Refiner → Solver
-  - Our 2-agent simplification: Planner (A) → Solver (B)
-
-Two agent roles:
-  Sender A   — "Planner Agent": design a step-by-step plan to solve the question.
-               Does NOT produce the final answer.
-  Receiver B — "Solver Agent": receives latent/text reasoning from A, produces
-               the final answer.
-
-KVComm original tasks (HotpotQA, TMath, RepoBench, SAMSum) keep their existing
-asymmetric prompt design (prompt_A ≠ prompt_B) since they naturally split
-context vs. question.
-"""
 from __future__ import annotations
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Sender A: Planner Agent Instructions
-# ══════════════════════════════════════════════════════════════════════════════
-# From LatentMAS paper (Appendix K, Section 20):
-#   "You are a Planner Agent. Given an input question, design a clear,
-#    step-by-step plan for how to solve the question."
-#
-# The paper uses the SAME Planner prompt for ALL task types (numeric, MCQ, code).
-# We keep this unified design for LatentMAS tasks and preserve KVComm-specific
-# prompts for KVComm original tasks.
-
-# ── Think-model variant (Qwen3, DeepSeek-R1, etc.) ──────────────────────────
-# Triggers <think> mode for latent thought generation.
 PLANNER_INSTRUCTION = (
-    "You are a Planner Agent. Given an input question, design a clear, "
-    "step-by-step plan for how to solve the question.\n\n"
-    "Your outlined plan should be concise with a few bulletpoints for each step. "
-    "Do not produce the final answer.\n"
+    "You are a Planner Agent. Given an input question, design a clear, step-by-step plan.\n\n"
+    "Keep the plan concise. Do not produce the final answer.\n"
     "Now output your plan to solve the question below:"
 )
-
-# ── Non-think variant (Llama-3, Mistral, etc.) ──────────────────────────────
-# These models don't have <think> mode, so we use the same Planner framing
-# but with explicit "reader" language to guide KV cache encoding.
 PLANNER_INSTRUCTION_NOTHINK = (
-    "You are a Planner Agent. Given an input question, read it carefully "
-    "and design a clear analysis plan.\n\n"
-    "Your outlined plan should be concise with a few bulletpoints for each step. "
-    "Do not produce the final answer.\n"
+    "You are a Planner Agent. Read the input question carefully and design a clear analysis plan.\n\n"
+    "Keep the plan concise. Do not produce the final answer.\n"
     "Now analyze the question below:"
 )
+LATENT_RECEIVER_PREFIX = (
+    "Information from the previous agent is available through transferred internal state. "
+    "Use it when relevant.\n\n"
+)
+TEXT_RECEIVER_PREFIX = "Information communicated by the previous agent:\n"
 
 
-# ── KVComm original tasks: keep asymmetric sender instructions ──────────────
-# These tasks have prompt_A ≠ prompt_B (context vs. question split).
-# Agent A acts as "context encoder", not "planner".
-
-_KVCOMM_SENDER_MATH_THINK = (
-    "Think deeply about the following mathematical hint. "
-    "Your internal reasoning will be used by another agent to solve a related problem."
-)
-_KVCOMM_SENDER_QA_THINK = (
-    "Think deeply about the following context passage. "
-    "Your internal reasoning will be used by another agent to answer a question about it."
-)
-_KVCOMM_SENDER_CODE_THINK = (
-    "Think deeply about the following code context. "
-    "Your internal reasoning will be used by another agent to complete the code."
-)
-_KVCOMM_SENDER_SUMMARIZE_THINK = (
-    "Think deeply about the following content. "
-    "Your internal reasoning will be used by another agent to summarize related content."
-)
-
-_KVCOMM_SENDER_MATH_NOTHINK = (
-    "You are a reader agent. Read the following mathematical hint carefully "
-    "and reason about the key facts, numbers, and relationships it contains."
-)
-_KVCOMM_SENDER_QA_NOTHINK = (
-    "You are a reader agent. Read the following context passage carefully "
-    "and reason about the key information it contains."
-)
-_KVCOMM_SENDER_CODE_NOTHINK = (
-    "You are a reader agent. Read the following code context carefully "
-    "and reason about the key functions, variables, and logic it contains."
-)
-_KVCOMM_SENDER_SUMMARIZE_NOTHINK = (
-    "You are a reader agent. Read the following content carefully "
-    "and reason about the main ideas and key information it contains."
-)
+def _validate(evaluator) -> None:
+    if not hasattr(evaluator, "validate_task_profile"):
+        raise ValueError("Evaluator does not expose the required task profile")
+    evaluator.validate_task_profile()
 
 
-# ── Sender A: message templates ──────────────────────────────────────────────
+def build_sender_core(evaluator, item: dict, is_think: bool = False) -> str:
+    """Build Agent A's semantic prompt; shared by text/full-KV/selective-KV."""
+    _validate(evaluator)
+    family = evaluator.prompt_family
+    input_mode = evaluator.sender_input_mode
+    task_type = evaluator.task_type
 
-_SENDER_MATH_TMPL = "Instruction: {instruction} Hint: {hint}"
-_SENDER_QA_TMPL = "Instruction: {instruction} Context: {context}"
-_SENDER_CODE_TMPL = "Instruction: {instruction} Context: {context}"
-_SENDER_SUMMARIZE_TMPL = "Instruction: {instruction} Content part 1: {content_part_1}"
+    if family == "kvcomm" and input_mode == "query_aware_context":
+        return (
+            "You are an Evidence Extraction Agent.\n\n"
+            "Read the context and target question carefully. Identify the exact evidence\n"
+            "needed by another agent to answer the target question.\n\n"
+            "Preserve entity names, aliases, dates, quantities, locations, definitions,\n"
+            "and relationships exactly as stated in the context. Do not invent information.\n"
+            "Do not produce the final answer.\n\n"
+            f"Context:\n{item['prompt_A']}\n\n"
+            f"Target Question:\n{item['prompt_B']}\n\n"
+            "Prepare concise evidence for the next agent:"
+        )
+
+    if family == "kvcomm" and input_mode == "native_split":
+        instructions = {
+            "math": "Read the mathematical hint carefully and communicate its key facts, numbers, and relationships.",
+            "code": "Read the code context carefully and communicate the key functions, variables, and logic.",
+            "summarization": "Read content part 1 carefully and communicate its main ideas and key information.",
+        }
+        labels = {"math": "Hint", "code": "Context", "summarization": "Content part 1"}
+        if task_type not in instructions:
+            raise ValueError(f"Unsupported native-split task_type={task_type!r}")
+        return f"Instruction: {instructions[task_type]} {labels[task_type]}: {item['prompt_A']}"
+
+    if family == "latentmas" and input_mode == "shared_problem":
+        instruction = PLANNER_INSTRUCTION if is_think else PLANNER_INSTRUCTION_NOTHINK
+        return f"{instruction}\nQuestion: {item['prompt_A']}"
+
+    raise ValueError(
+        f"Unsupported sender profile: {family}/{task_type}/{input_mode} "
+        f"for {getattr(evaluator, 'name', type(evaluator).__name__)}"
+    )
+
+
+def build_receiver_core(evaluator, item: dict, allow_b_think: bool = False) -> str:
+    """Build Agent B's task prompt without a communication-modality wrapper."""
+    _validate(evaluator)
+    family = evaluator.prompt_family
+    input_mode = evaluator.sender_input_mode
+    task_type = evaluator.task_type
+    answer_format = evaluator.answer_format
+
+    if family == "kvcomm" and input_mode == "query_aware_context":
+        return (
+            "You are the final Answering Agent.\n\n"
+            "Use the information provided by the previous agent to answer the target\n"
+            "question. Do not invent unsupported information.\n\n"
+            f"Target Question:\n{item['prompt_B']}\n\n"
+            "Return only the shortest answer that fully answers the question.\n"
+            "Do not provide explanations."
+        )
+
+    if family == "kvcomm" and input_mode == "native_split":
+        if task_type == "math":
+            instruction = "Answer the math problem step by step." if allow_b_think else "Directly answer the math problem with the final result."
+            return f"Instruction: {instruction} Question: {item['prompt_B']}"
+        if task_type == "code":
+            return f"Instruction: Complete ONLY THE NEXT LINE of the code snippet based on the context. Code Snippet: {item['prompt_B']}"
+        if task_type == "summarization":
+            return f"Instruction: Summarize the following content concisely with one sentence. Content part 2: {item['prompt_B']}"
+
+    if family == "latentmas" and input_mode == "shared_problem":
+        target = f"Target Question: {item['prompt_B']}\n\n"
+        if answer_format == "boxed_integer":
+            reasoning = "Now, reason step by step and " if allow_b_think else ""
+            return target + reasoning + "output the final answer inside \\boxed{YOUR_FINAL_ANSWER}:"
+        if answer_format == "boxed_choice":
+            reasoning = "Reason step by step. " if allow_b_think else ""
+            return target + reasoning + "Return only option A, B, C, or D inside \\boxed{YOUR_FINAL_ANSWER}."
+        if answer_format == "python":
+            reasoning = "Reason step by step, then " if allow_b_think else ""
+            return target + reasoning + "put all self-contained Python code in one ```python``` markdown code block."
+
+    raise ValueError(
+        f"Unsupported receiver profile: {family}/{task_type}/{input_mode}/{answer_format} "
+        f"for {getattr(evaluator, 'name', type(evaluator).__name__)}"
+    )
 
 
 def build_latent_sender_msg(evaluator, item: dict, is_think: bool = False) -> str:
-    """
-    Build the user-role message string for sender A.
-
-    LatentMAS tasks: uses unified Planner prompt from LatentMAS paper.
-    KVComm tasks:    uses task-specific context-encoder prompts.
-
-    Args:
-        evaluator: Task evaluator (used to detect task type via hasattr flags).
-        item:      Dataset item dict with "prompt_A" key.
-        is_think:  Whether model_A is a thinking model.
-
-    Returns:
-        str: Formatted message string for model_A.
-    """
-    # ── KVComm original tasks (asymmetric: prompt_A ≠ prompt_B) ──────────────
-    if hasattr(evaluator, "tmath"):
-        inst = _KVCOMM_SENDER_MATH_THINK if is_think else _KVCOMM_SENDER_MATH_NOTHINK
-        return _SENDER_MATH_TMPL.format(instruction=inst, hint=item["prompt_A"])
-
-    elif hasattr(evaluator, "repobench"):
-        inst = _KVCOMM_SENDER_CODE_THINK if is_think else _KVCOMM_SENDER_CODE_NOTHINK
-        return _SENDER_CODE_TMPL.format(instruction=inst, context=item["prompt_A"])
-
-    elif hasattr(evaluator, "sasum"):
-        inst = _KVCOMM_SENDER_SUMMARIZE_THINK if is_think else _KVCOMM_SENDER_SUMMARIZE_NOTHINK
-        return _SENDER_SUMMARIZE_TMPL.format(instruction=inst, content_part_1=item["prompt_A"])
-
-    # ── LatentMAS tasks (symmetric: prompt_A ≈ prompt_B) ─────────────────────
-    # All LatentMAS tasks use the unified Planner prompt from the paper.
-    # Agent A = Planner: "design a step-by-step plan, do not produce the final answer"
-    else:
-        planner_inst = PLANNER_INSTRUCTION if is_think else PLANNER_INSTRUCTION_NOTHINK
-        return f"{planner_inst}\nQuestion: {item['prompt_A']}"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Receiver B: Solver Agent
-# ══════════════════════════════════════════════════════════════════════════════
-# From LatentMAS paper (Appendix K):
-#   "You are a helpful assistant. You are provided with latent information
-#    for reference and a target question to solve."
-#   "The latent information might contain irrelevant contents. Ignore it if
-#    it is not helpful for solving the target question."
-
-# ── Latent receiver prefix (for LatentMAS — B receives KV cache) ─────────────
-LATENT_RECEIVER_PREFIX = (
-    "You are a helpful assistant. You are provided with latent information "
-    "for reference and a target question to solve.\n"
-    "The latent information might contain irrelevant contents. "
-    "Ignore it if it is not helpful for solving the target question.\n"
-)
-
-# ── Text receiver prefix (for TextMAS — B receives Agent A's text reasoning) ─
-TEXT_RECEIVER_PREFIX = (
-    "You are a helpful assistant. You are provided with reasoning from another "
-    "agent for reference and a target question to solve.\n"
-    "The reasoning might not be fully relevant. "
-    "Ignore it if it is not helpful for solving the target question.\n"
-)
-
-
-def _get_receiver_core_msg(evaluator, item: dict, allow_b_think: bool = False) -> str:
-    """
-    Build the core task instruction and question for Receiver B (Solver).
-
-    Uses Solver prompt templates from LatentMAS paper (Appendix K).
-    Three task groups: numeric, MCQ, code.
-
-    For KVComm original tasks, falls back to eval.py templates.
-    """
-    from eval import (
-        COMMUNICATION_MATH_MSG_TEMPLATE_B,
-        COMMUNICATION_QA_MSG_TEMPLATE_B,
-        COMMUNICATION_CODE_MSG_TEMPLATE_B,
-        COMMUNICATION_SUMMARIZE_MSG_TEMPLATE_B,
-        MATH_INSTRUCTION,
-        QA_INSTRUCTION,
-        CODE_INSTRUCTION,
-        SUMMARIZE_INSTRUCTION,
-    )
-
-    # ── KVComm original tasks (keep existing B prompts) ──────────────────────
-    if hasattr(evaluator, "tmath"):
-        instruction = MATH_INSTRUCTION if allow_b_think else "Directly answer the math problem with the final result."
-        return COMMUNICATION_MATH_MSG_TEMPLATE_B.format(
-            instruction=instruction,
-            question=item["prompt_B"],
-        )
-    elif hasattr(evaluator, "repobench"):
-        return COMMUNICATION_CODE_MSG_TEMPLATE_B.format(
-            instruction=CODE_INSTRUCTION,
-            code_snippet=item["prompt_B"],
-        )
-    elif hasattr(evaluator, "sasum"):
-        return COMMUNICATION_SUMMARIZE_MSG_TEMPLATE_B.format(
-            instruction=SUMMARIZE_INSTRUCTION,
-            content_part_2=item["prompt_B"],
-        )
-
-    # ── LatentMAS tasks: Solver prompts from paper (Appendix K) ──────────────
-
-    # --- Numeric tasks (GSM8K, AIME) ---
-    # Paper Solver: "Now, reason step by step and output the final answer
-    #                inside \boxed{YOUR_FINAL_ANSWER}:"
-    elif hasattr(evaluator, "gsm8k") or hasattr(evaluator, "aime"):
-        if allow_b_think:
-            return (
-                f"Target Question: {item['prompt_B']}\n\n"
-                f"Now, reason step by step and output the final answer inside "
-                f"\\boxed{{YOUR_FINAL_ANSWER}}:"
-            )
-        else:
-            return (
-                f"Target Question: {item['prompt_B']}\n\n"
-                f"Output the final answer inside \\boxed{{YOUR_FINAL_ANSWER}}:"
-            )
-
-    # --- MCQ tasks (MedQA, ARC-E/C, GPQA) ---
-    # Paper Solver: "Your final answer must be selected from A,B,C,D.
-    #                For example \boxed{A}. Do not add any other contents inside the box."
-    elif (hasattr(evaluator, "medqa") or hasattr(evaluator, "arc_easy")
-          or hasattr(evaluator, "arc_challenge") or hasattr(evaluator, "gpqa")):
-        if allow_b_think:
-            return (
-                f"Target Question: {item['prompt_B']}\n\n"
-                f"Your final answer must be selected from A, B, C, D. "
-                f"For example \\boxed{{A}}. Do not add any other contents inside the box.\n"
-                f"Now, reason step by step and output the final answer inside "
-                f"\\boxed{{YOUR_FINAL_ANSWER}}:"
-            )
-        else:
-            return (
-                f"Target Question: {item['prompt_B']}\n\n"
-                f"Your final answer must be selected from A, B, C, D. "
-                f"For example \\boxed{{A}}. Do not add any other contents inside the box."
-            )
-
-    # --- Code tasks (MBPP+, HumanEval+) ---
-    # Paper Solver: "You must put all python code as self-contained Python function
-    #                in markdown code blocks."
-    elif hasattr(evaluator, "mbppplus") or hasattr(evaluator, "humanevalplus"):
-        if allow_b_think:
-            return (
-                f"Target Question: {item['prompt_B']}\n\n"
-                f"You must put all python code as self-contained Python function "
-                f"in markdown code blocks.\n"
-                f"Do not add any other contents inside the markdown code block.\n"
-                f"Now, reason step by step and output the final answer inside "
-                f"```python\nYOUR_PYTHON_CODE\n```:"
-            )
-        else:
-            return (
-                f"Target Question: {item['prompt_B']}\n\n"
-                f"Put all your Python code inside a markdown code block:\n"
-                f"```python\nYOUR_CODE_HERE\n```\n"
-                f"Do not add any other contents inside the code block."
-            )
-
-    else:
-        # Default: general QA (KVComm fallback)
-        return COMMUNICATION_QA_MSG_TEMPLATE_B.format(
-            instruction=QA_INSTRUCTION,
-            question=item["prompt_B"],
-        )
+    return build_sender_core(evaluator, item, is_think=is_think)
 
 
 def build_latent_receiver_msg(evaluator, item: dict, allow_b_think: bool = False) -> str:
-    """
-    Build the user-role message string for receiver B in LatentMAS.
-    Uses paper Solver prefix: "You are provided with latent information for reference..."
-    """
-    return LATENT_RECEIVER_PREFIX + _get_receiver_core_msg(evaluator, item, allow_b_think=allow_b_think)
+    return LATENT_RECEIVER_PREFIX + build_receiver_core(evaluator, item, allow_b_think)
 
 
 def build_text_receiver_msg(evaluator, item: dict, response_A: str = "", allow_b_think: bool = False) -> str:
-    """
-    Build the user-role message string for receiver B in TextMAS.
-    Uses clean text prefix: "You are provided with reasoning from another agent..."
-    followed by Agent A's reasoning, then the target question and task instructions.
-    """
-    core_msg = _get_receiver_core_msg(evaluator, item, allow_b_think=allow_b_think)
-    if response_A:
-        return (
-            f"{TEXT_RECEIVER_PREFIX}\n"
-            f"Agent A's reasoning:\n{response_A}\n\n"
-            f"{core_msg}"
-        )
-    return TEXT_RECEIVER_PREFIX + core_msg
+    core = build_receiver_core(evaluator, item, allow_b_think)
+    if not response_A:
+        return core
+    return (
+        f"{TEXT_RECEIVER_PREFIX}<previous_agent_information>\n{response_A}\n"
+        f"</previous_agent_information>\n\n{core}"
+    )

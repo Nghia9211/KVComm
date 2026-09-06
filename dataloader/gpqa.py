@@ -71,6 +71,7 @@ class GPQAEvaluator(BaseEvaluator):
         self.n_samples = n_samples
         self.gpqa = True             # task-detection flag for prompts_latent.py
         self.name = "gpqa"
+        self.configure_task_profile(prompt_family="latentmas", task_type="qa", sender_input_mode="shared_problem", answer_format="boxed_choice", prompt_version="latentmas_two_agent_v1", primary_metric="legacy_match", sender_max_tokens=2048)
         self.data = self.load_data()
 
     def load_data(self):
