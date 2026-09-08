@@ -50,6 +50,6 @@ def build_response_record(
         "latent": {
             "steps": latent_steps,
             "layer_selection_mode": layer_selection_mode,
-            "selected_layers": selected_layers,
+            "selected_layers": [int(x) for x in selected_layers] if selected_layers is not None else None,
         },
     }
