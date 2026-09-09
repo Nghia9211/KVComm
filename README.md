@@ -326,9 +326,12 @@ Evaluated on `Qwen/Qwen3-4B → Qwen/Qwen3-4B`, `seed=42`, `temperature=0.6`, `t
 | Mode 1 (Full KV) | `--do_test_latent` | 40 | ❌ | 0.6816 | 2001s |
 | Mode 1 (Full KV) | `--do_test_latent` | 80 | ❌ | 0.6898 | 2956s |
 | **Mode 2 (KV Top 70%)** | `--do_test_latent --latent_kv_select` | 10 | ✅ | 0.6691 | 680s |
-| **Mode 2 (KV Top 70%)** | `--do_test_latent --latent_kv_select` | 20 | ✅ | **0.6827** | 1014s |
+| **Mode 2 (KV Top 70%)** | `--do_test_latent --latent_kv_select` | 20 | ✅ | 0.6827 | 1014s |
+| **Mode 2 (KV Top 70%)** | `--do_test_latent --latent_kv_select` | 40 | ✅ | 0.6897 | 1804s |
+| **Mode 2 (KV Top 70%)** | `--do_test_latent --latent_kv_select` | 80 | ✅ | **0.6928** | 3071s |
 | Mode 4 (Dual KV Legacy) | `--do_test_latent --dual_kv_select` | 10 | ✅ (whole layer) | 0.3814 | 874s |
-| **Mode 5 (Segmented Dual-KV)** | `--do_test_latent --segmented_kv_select` | — | ✅ (per segment) | *pending* | — |
+| **Mode 5 (Segmented Dual-KV, Top 70%)** | `--do_test_latent --segmented_kv_select` | 10 | ✅ (per segment) | 0.5707 | 1343s |
+| **Mode 5 (Segmented Dual-KV, Full 100%)** | `--do_test_latent --segmented_kv_select` | 10 | ❌ (all layers) | 0.6739 | 1225s |
 
 #### TMATH (300 samples, `legacy_match`, prompt v1)
 
@@ -359,7 +362,7 @@ Evaluated on `Qwen/Qwen3-4B → Qwen/Qwen3-4B`, `seed=42`, `temperature=0.6`, `t
 | Mode | Script flag | Latent Steps | KV Select | Score | Time |
 |------|------------|:---:|-----------|:---:|:---:|
 | **Mode 2 (KV Top 70%)** | `--do_test_latent --latent_kv_select` | 10 | ✅ | **0.6524** | 25782s |
-| Mode 1 (Full KV) | `--do_test_latent` | 10 | ❌ | *(running)* | — |
+| **Mode 1 (Full KV)** | `--do_test_latent` | 10 | ❌ | **0.6524** | 26938s |
 
 ### Output Files
 

@@ -21,8 +21,12 @@
 | LatentMAS | Mode 1 (Full KV) | 40 | 100% (36/36) | 0.6816 | 2000.7s (33.3m) | 4.00s |
 | LatentMAS | Mode 1 (Full KV) | 80 | 100% (36/36) | 0.6898 | 2955.8s (49.3m) | 5.91s |
 | LatentMAS + KVComm | Mode 2 (Top 70% KV) | 10 | 69.4% (25/36) | 0.6691 | 679.7s (11.3m) | 1.36s |
-| LatentMAS + KVComm | Mode 2 (Top 70% KV) | 20 | 69.4% (25/36) | **0.6827** | 1014.2s (16.9m) | 2.03s |
+| LatentMAS + KVComm | Mode 2 (Top 70% KV) | 20 | 69.4% (25/36) | 0.6827 | 1014.2s (16.9m) | 2.03s |
+| LatentMAS + KVComm | Mode 2 (Top 70% KV) | 40 | 69.4% (25/36) | 0.6897 | 1804.1s (30.1m) | 3.61s |
+| LatentMAS + KVComm | Mode 2 (Top 70% KV) | 80 | 69.4% (25/36) | **0.6928** | 3071.0s (51.2m) | 6.14s |
 | Dual-KV (Legacy) | Mode 4 (Split 0.5) | 10 | 70%+70% | 0.3814 | 873.9s (14.6m) | 1.75s |
+| Segmented Dual-KV | Mode 5 (Top 70% Ctx / Top 70% Lat) | 10 | Ctx 69.4% (25/36), Lat 69.4% (25/36) | 0.5707 | 1343.4s (22.4m) | 2.69s |
+| Segmented Dual-KV | Mode 5 (Full Ctx / Full Lat) | 10 | Ctx 100% (36/36), Lat 100% (36/36) | 0.6739 | 1224.5s (20.4m) | 2.45s |
 
 ---
 
@@ -78,9 +82,7 @@
 * **Metric**: `legacy_match`  
 * **Cấu hình model**: `max_tokens_A=4096`, `max_tokens_B=4096`, `allow_b_think=True`
 
-| Phương pháp | Mode | Latent Steps | Tỉ lệ giữ KV | Score | Thời gian |
+| Phương pháp | Mode | Latent Steps | Tỉ lệ giữ KV | Score | Thời gian (164 mẫu) |
 |---|---|:---:|:---:|:---:|:---:|
 | LatentMAS + KVComm | Mode 2 (Top 70% KV) | 10 | 69.4% (25/36) | **0.6524** | 25782.1s (7.16h) |
-| LatentMAS | Mode 1 (Full KV) | 10 | 100% (36/36) | *(đang chạy)* | — |
-
-> ⚠️ Run Mode 1 HumanEval+ đang chạy (snapshot `..._0909_061550`, 120 samples hoàn thành tính đến 09/09/2026).
+| LatentMAS | Mode 1 (Full KV) | 10 | 100% (36/36) | **0.6524** | 26938.5s (7.48h) |
