@@ -52,13 +52,9 @@ def build_response_record(
         "latent": {
             "steps": latent_steps,
             "layer_selection_mode": layer_selection_mode,
-<<<<<<< HEAD
             "selected_layers": [int(x) for x in selected_layers] if selected_layers is not None else None,
-=======
-            "selected_layers": selected_layers,
-            "context_layers": context_layers,
-            "latent_layers": latent_layers,
+            "context_layers": [int(x) for x in context_layers] if context_layers is not None else None,
+            "latent_layers": [int(x) for x in latent_layers] if latent_layers is not None else None,
             "segmented_stats": dict(segmented_stats or {}),
->>>>>>> 80fcb4dc37501c3bc2511a8cdb34a6b1865ac2c4
         },
     }
