@@ -1,37 +1,14 @@
 # Problem Statement (v1): Current Findings & Problems to Be Solved
 
-> **Status**: Draft v1 — 2026-08-15
-> **Companion doc**: [proposal_v1.md](proposal_v1.md) — each problem below maps to a proposed direction there.
-> **Evidence base**: `EXPERIMENT_RESULTS.md` (updated 2026-08-11); `Qwen/Qwen3-4B`, `suayptalha/DeepSeek-R1-Distill-Llama-3B`; HotpotQA (500), MedQA (300), TMATH (300), MultiFieldQA-EN (150).
+> **Status**: Draft v1 — 2026-08-15 (results updated 2026-09-09)  
+> **Companion doc**: [proposal_v1.md](proposal_v1.md) — each problem below maps to a proposed direction there.  
+> **Experimental results**: See [EXPERIMENT_RESULTS.md](../EXPERIMENT_RESULTS.md).
 
 ---
 
 ## 1. Current Findings
 
-### F1 — Latent thinking helps reasoning tasks
-LatentMAS (A runs N latent thinking steps before KV transfer) beats plain KVComm where the task requires multi-hop or mathematical reasoning:
-
-| Task | Plain KVComm | Best LatentMAS | Gain |
-|---|---:|---:|---:|
-| HotpotQA (Qwen3-4B) | 70.00% | **72.80%** (Mode 1, N=1–2) | +2.80 |
-| TMATH (DeepSeek-R1-Distill) | ~31.0% | **36.00%** (Mode 2, N=1) | +5.00 |
-| TMATH (Qwen3-4B) | 31.36% | **34.12%** (Mode 1, N=10) | +2.76 |
-| MedQA (Qwen3-4B) | 58.33% | **59.00%** (Mode 1, N=5) | +0.67 |
-
-### F2 — Latent thinking hurts long-context extraction
-On MultiFieldQA-EN (verbatim factual retrieval from long documents), plain KVComm leads: **50.00%** vs. 47.33% for the best LatentMAS config. Forcing A into a `<think>`-style reasoning state distorts the direct context representation B needs to extract entities.
-
-### F3 — Fewer latent steps are better; long loops degenerate
-Peak accuracy occurs at N=1–5 on every task. Beyond N≈10, accuracy decays monotonically and garbage responses grow — on DeepSeek-R1-Distill/TMATH: 0.3% garbage at N=1 → 3.7% at N=10 → 6.0% at N=25, with accuracy falling from 33.0% to 29.0%. Distilled models are the most fragile.
-
-### F4 — Uniform layer pruning conflicts with latent transfer
-With latent thinking enabled, Mode 1 (all layers) beats Mode 2 (top-70% importance-selected layers) by ~3–5 points on HotpotQA (72.80% vs. 70.00%) and MultiFieldQA-EN (47.33% vs. 42.67%). Cutting 30% of layers uniformly across the whole sequence discards information critical for long inputs. (Exception: TMATH on DeepSeek-R1-Distill, where Mode 2 wins — the pattern is task/model-dependent.)
-
-### F5 — Latent variants pay a heavy latency cost
-Plain KVComm on MedQA: 5 min; latent variants: 40–60 min (8–10× slower). Causes: N additional forward passes through A with a growing KV cache (O(N·T_A)), and B must attend over T_A + N + T_B tokens instead of T_B.
-
-### F6 — No gain without information asymmetry
-MedQA shows only +0.67 headroom: A and B see the same information, so there is little for the communication channel to add.
+> *(This section will be updated once full benchmark results are compiled.)*
 
 ---
 

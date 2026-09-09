@@ -17,16 +17,13 @@ Hai chế độ được so sánh:
 - **Mode 1** — suy nghĩ ẩn + toàn bộ KV cache (tất cả các lớp) được chuyển sang B.
 - **Mode 2** — suy nghĩ ẩn + truyền lớp chọn lọc (KVComm, top-k% số lớp).
 
-## 2. Các Phát hiện Chính cho đến Nay (EXPERIMENT_RESULTS.md, Tháng 8/2026)
+## 2. Các Phát hiện Chính cho đến Nay
 
-1. **Suy nghĩ ẩn hỗ trợ các nhiệm vụ suy luận.** LatentMAS vượt qua KVComm thuần trên HotpotQA (72.80% so với 70.00%) và TMATH (+2.7 đến +5.0 điểm). Ít bước ẩn (1–5) cho kết quả tốt nhất; vượt quá ~10 bước, độ chính xác giảm dần và phản hồi rác tăng lên (lên tới 6% trên DeepSeek-R1-Distill ở 25 bước).
-2. **Suy nghĩ ẩn gây hại cho các nhiệm vụ trích xuất.** Trên MultiFieldQA-EN (truy xuất thực tế ngữ cảnh dài), KVComm thuần dẫn đầu (50.00% so với 47.33%): ép A vào trạng thái suy luận làm biến dạng biểu diễn ngữ cảnh nguyên văn mà B cần.
-3. **Tỉa bớt lớp đồng nhất xung đột với truyền suy nghĩ ẩn.** Khi bật suy nghĩ ẩn, Mode 1 (đầy đủ các lớp) vượt trội so với Mode 2 (top 70%) khoảng ~3–5 điểm trên HotpotQA và MultiFieldQA-EN — việc cắt giảm các lớp một cách đồng nhất trên toàn bộ chuỗi sẽ loại bỏ thông tin quan trọng đối với đầu vào dài.
-4. **Đánh đổi về độ trễ.** KVComm thuần nhanh hơn nhiều (ví dụ: MedQA: 5 phút so với 40–60 phút cho các biến thể ẩn), vì các biến thể ẩn thêm N lượt lan truyền tiến trên A và mở rộng ngữ cảnh mà B phải chú ý (T_A + N + T_B).
-
-**Thấu hiểu cốt lõi**: truyền thông KV ẩn vượt trội hơn trao đổi văn bản đối với nhiệm vụ suy luận, nhưng việc truyền tải phải trở nên *thích ứng với nội dung và nhiệm vụ* thay vì áp dụng đồng nhất.
+> *(Phần này sẽ được cập nhật lại sau khi có đủ kết quả benchmark.)*  
+> Xem kết quả thực nghiệm hiện tại tại [EXPERIMENT_RESULTS.md](../EXPERIMENT_RESULTS.md).
 
 ## 3. Các Hướng Đề xuất
+
 
 ### 3.1 Định tuyến KV Chọn lọc Kép (Dual-Selective KV Routing)
 Định tuyến KV **theo từng đoạn token tại mỗi layer**, thay vì cắt toàn bộ cache

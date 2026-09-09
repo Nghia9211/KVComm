@@ -314,15 +314,52 @@ python com_latent.py --model_A suayptalha/DeepSeek-R1-Distill-Llama-3B --model_B
 
 ### Comparison Table
 
-| Mode | Script flag | Latent | KV Select | Expected Score (hotpotqa) |
-|------|------------|--------|-----------|--------------------------|
-| Baseline (B only) | `--do_test_baseline` | ❌ | ❌ | ~0.30 |
-| Skyline (full context) | `--do_test_skyline` | ❌ | ❌ | ~0.65 |
-| KVComm (no latent) | `--do_test` | ❌ | ✅ | ~0.60 |
-| LatentMAS standalone | `--do_test_latent` | ✅ | ❌ | ~0.35 |
-| **LatentMAS + KVComm** | `--do_test_latent --latent_kv_select` | ✅ | ✅ | **TBD** |
-| Legacy Dual-KV | `--do_test_latent --dual_kv_select` | ✅ | ✅ (whole layer) | **TBD** |
-| **Segmented Dual-KV** | `--do_test_latent --segmented_kv_select` | ✅ | ✅ (per segment) | **TBD** |
+Evaluated on `Qwen/Qwen3-4B → Qwen/Qwen3-4B`, `seed=42`, `temperature=0.6`, `top_p=0.95`. See [EXPERIMENT_RESULTS.md](EXPERIMENT_RESULTS.md) for full details.
+
+#### HotpotQA (500 samples, `longbench_qa_f1`, prompt v2)
+
+| Mode | Script flag | Latent Steps | KV Select | F1 Score | Time (500 samples) |
+|------|------------|:---:|-----------|:---:|:---:|
+| TextMAS | `--do_test_nld` | — | ❌ | **0.7242** | 9290s |
+| Mode 1 (Full KV) | `--do_test_latent` | 10 | ❌ | 0.6697 | 779s |
+| Mode 1 (Full KV) | `--do_test_latent` | 20 | ❌ | 0.6739 | 1090s |
+| Mode 1 (Full KV) | `--do_test_latent` | 40 | ❌ | 0.6816 | 2001s |
+| Mode 1 (Full KV) | `--do_test_latent` | 80 | ❌ | 0.6898 | 2956s |
+| **Mode 2 (KV Top 70%)** | `--do_test_latent --latent_kv_select` | 10 | ✅ | 0.6691 | 680s |
+| **Mode 2 (KV Top 70%)** | `--do_test_latent --latent_kv_select` | 20 | ✅ | **0.6827** | 1014s |
+| Mode 4 (Dual KV Legacy) | `--do_test_latent --dual_kv_select` | 10 | ✅ (whole layer) | 0.3814 | 874s |
+| **Mode 5 (Segmented Dual-KV)** | `--do_test_latent --segmented_kv_select` | — | ✅ (per segment) | *pending* | — |
+
+#### TMATH (300 samples, `legacy_match`, prompt v1)
+
+| Mode | Script flag | Latent Steps | KV Select | Score | Time (300 samples) |
+|------|------------|:---:|-----------|:---:|:---:|
+| TextMAS | `--do_test_nld` | — | ❌ | 0.3710 | 21561s |
+| **Mode 1 (Full KV)** | `--do_test_latent` | 10 | ❌ | **0.3864** | 11268s |
+| Mode 2 (KV Top 70%) | `--do_test_latent --latent_kv_select` | 10 | ✅ | 0.3782 | 10533s |
+| Mode 4 (Dual KV Legacy) | `--do_test_latent --dual_kv_select` | 10 | ✅ (whole layer) | 0.3751 | 11777s |
+
+#### MedQA (300 samples, Accuracy, prompt v1)
+
+| Mode | Script flag | Latent Steps | KV Select | Accuracy | Time (300 samples) |
+|------|------------|:---:|-----------|:---:|:---:|
+| TextMAS | `--do_test_nld` | — | ❌ | 0.6767 | 46347s |
+| Mode 1 (Full KV) | `--do_test_latent` | 10 | ❌ | 0.6667 | 26823s |
+| **Mode 2 (KV Top 70%)** | `--do_test_latent --latent_kv_select` | 10 | ✅ | **0.6867** | 24028s |
+| Mode 4 (Dual KV Legacy) | `--do_test_latent --dual_kv_select` | 10 | ✅ (whole layer) | 0.6600 | 35074s |
+
+#### MultiFieldQA-EN (150 samples, `longbench_qa_f1`, prompt v2)
+
+| Mode | Script flag | Latent Steps | KV Select | F1 Score | Time (150 samples) |
+|------|------------|:---:|-----------|:---:|:---:|
+| TextMAS | `--do_test_nld` | — | ❌ | **0.5052** | 2924s |
+
+#### HumanEval+ (164 samples, `legacy_match`, prompt v1)
+
+| Mode | Script flag | Latent Steps | KV Select | Score | Time |
+|------|------------|:---:|-----------|:---:|:---:|
+| **Mode 2 (KV Top 70%)** | `--do_test_latent --latent_kv_select` | 10 | ✅ | **0.6524** | 25782s |
+| Mode 1 (Full KV) | `--do_test_latent` | 10 | ❌ | *(running)* | — |
 
 ### Output Files
 

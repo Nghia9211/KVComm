@@ -17,16 +17,13 @@ Two modes are compared:
 - **Mode 1** — latent thinking + full KV cache (all layers) passed to B.
 - **Mode 2** — latent thinking + selective layer transfer (KVComm, top-k% layers).
 
-## 2. Key Findings So Far (EXPERIMENT_RESULTS.md, Aug 2026)
+## 2. Key Findings So Far
 
-1. **Latent thinking helps reasoning tasks.** LatentMAS beats plain KVComm on HotpotQA (72.80% vs. 70.00%) and TMATH (+2.7 to +5.0 points). Few latent steps (1–5) are best; beyond ~10 steps accuracy decays and garbage responses increase (up to 6% on DeepSeek-R1-Distill at 25 steps).
-2. **Latent thinking hurts extraction tasks.** On MultiFieldQA-EN (long-context factual retrieval), plain KVComm leads (50.00% vs. 47.33%): forcing A into a reasoning state distorts the verbatim context representation B needs.
-3. **Uniform layer pruning conflicts with latent transfer.** With latent thinking on, Mode 1 (full layers) beats Mode 2 (top 70%) by ~3–5 points on HotpotQA and MultiFieldQA-EN — pruning layers uniformly across the whole sequence discards information critical for long inputs.
-4. **Latency trade-off.** Plain KVComm is far faster (e.g. MedQA: 5 min vs. 40–60 min for latent variants), since latent variants add N forward passes on A and enlarge the context B must attend to (T_A + N + T_B).
-
-**Core insight**: latent KV communication beats text exchange for reasoning, but the transfer must become *content- and task-adaptive* rather than uniform.
+> *(This section will be updated once full benchmark results are compiled.)*  
+> See current experimental results at [EXPERIMENT_RESULTS.md](../EXPERIMENT_RESULTS.md).
 
 ## 3. Proposed Directions
+
 
 ### 3.1 Dual-Selective KV Routing
 Route KV **per token segment at each layer** instead of pruning the complete
