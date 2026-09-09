@@ -1,15 +1,23 @@
 """
 com_latent.py — Entry point for KVComm + LatentMAS integration
 
-Extends com.py with latent thinking params and two operating modes:
+Extends com.py with latent thinking and multiple KV communication modes.
 
-  Mode 1 — LatentMAS standalone (--no_latent_kv_select):
+  Mode 1 — LatentMAS standalone (without --latent_kv_select):
     Sender A runs latent thinking; full KV cache (all layers) is shared
     with receiver B. Equivalent to LatentMAS with KVComm agent setup.
 
   Mode 2 — KVComm + LatentMAS (--latent_kv_select):
     Sender A runs latent thinking; KV cache is layer-selected via
     CVCommunicator.prepare_key_cache() before being passed to B.
+
+  Mode 4 — legacy depth split (--dual_kv_select):
+    Unions shallow/deep layer groups and transfers full context+latent KV at
+    each retained layer. Kept to compare against previous experiment logs.
+
+  Mode 5 — Segmented Dual-KV (--segmented_kv_select):
+    Independently ranks and routes context-token and latent-token KV segments
+    at each layer while preserving the original sink and logical RoPE frame.
 
 Comparison baselines (inherited from com.py):
   --do_test_skyline   Skyline (A+B see everything)
@@ -57,6 +65,8 @@ import logging
 import random
 import json
 import hashlib
+import time
+import gc
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Literal
@@ -70,6 +80,7 @@ from eval_latent import LatentCommunicationEvaluator, TextMASEvaluator
 from utils import setup_logging, log_gpu_info, generate_run_name
 from dataloader import get_evaluator
 from layer_importance import get_top_layers, get_layer_ranking
+from segmented_kv import select_segmented_layers
 from prompts_latent import build_sender_core, build_receiver_core
 
 
@@ -95,7 +106,7 @@ class LatentAlignConfig:
     layer_to: int = -1  # -1 = all layers (auto-detect from model)
     layers_list: list[int] = field(default_factory=lambda: [-1])
     top_layers: float = 0.0
-    calib_size: int = 1
+    calib_size: int = 5
     do_layer_curve: bool = False
     alpha: float = 1.0
     mu: float = 0.5
@@ -109,9 +120,6 @@ class LatentAlignConfig:
     # latent_kv_select=False → Mode 1 (all layers, LatentMAS standalone)
     # latent_kv_select=True  → Mode 2 (layer selection via CVCommunicator)
     latent_kv_select: bool = False
-    # latent_only=False → B receives full T_input + N_latent KV tokens (backward-compat)
-    # latent_only=True  → B receives only the N_latent compressed thought tokens
-    latent_only: bool = False
     allow_b_think: bool = False
     # TextMAS sender budget. 0 means evaluator.sender_max_tokens.
     max_tokens_A: int = 0
@@ -128,13 +136,16 @@ class LatentAlignConfig:
     # "latent half" (reasoning abstraction, N tokens), select top-k% from each.
     # Mutually exclusive with --latent_kv_select (Mode 2).
     dual_kv_select: bool = False
+    # Mode 5: independently select the pre-latent input and latent-token KV
+    # segments at each layer using two attention rankings.
+    segmented_kv_select: bool = False
     # split_ratio: fraction of A's layers (from shallow end) reserved for the context half.
     # E.g. 0.4 with 36 layers → layers 0–13 for context, layers 14–35 for latent.
     split_ratio: float = 0.4
-    # context_top_ratio: fraction of context-half layers to include (1.0 = all).
-    context_top_ratio: float = 1.0
-    # latent_top_ratio: fraction of latent-half layers to include (1.0 = all).
-    latent_top_ratio: float = 1.0
+    # Mode 4 interprets these ratios inside its depth halves. Mode 5 ranks all
+    # layers independently for each segment. V1 keeps floor(70% * L) per set.
+    context_top_ratio: float = 0.7
+    latent_top_ratio: float = 0.7
 
     # ── §3.2 Convergence Tracking ──────────────────────────────────────────
     # If True, log cosine similarity between consecutive hidden states after each
@@ -190,6 +201,11 @@ def generate_latent_run_name(cfg: LatentAlignConfig) -> str:
             latent_suffix += f"_ctx{cfg.context_top_ratio}"
         if cfg.latent_top_ratio < 1.0:
             latent_suffix += f"_lat{cfg.latent_top_ratio}"
+    elif cfg.segmented_kv_select:
+        latent_suffix += (
+            f"_segKV_ctx{cfg.context_top_ratio}_lat{cfg.latent_top_ratio}"
+            f"_cal{cfg.calib_size}"
+        )
     elif cfg.latent_kv_select:
         latent_suffix += "_kvsel"
     latent_suffix += f"_pv2_mv2_B{cfg.max_tokens_B}"
@@ -225,7 +241,7 @@ def main(cfg: LatentAlignConfig):
 
     # Response log paths — one file per mode so they don't overwrite each other
     response_log_dir  = final_snapshot_path
-    response_log_path = os.path.join(response_log_dir, "responses.jsonl")  # default (latent)
+    response_log_path = os.path.join(response_log_dir, "latent_responses.jsonl")
     skyline_log_path  = os.path.join(response_log_dir, "skyline_responses.jsonl")
     baseline_log_path = os.path.join(response_log_dir, "baseline_responses.jsonl")
     kvcomm_log_path   = os.path.join(response_log_dir, "kvcomm_responses.jsonl")
@@ -287,6 +303,13 @@ def main(cfg: LatentAlignConfig):
     receiver_core = build_receiver_core(evaluator, first_item, allow_b_think=cfg.allow_b_think) if first_item else ""
     effective_a_budget = cfg.max_tokens_A if cfg.max_tokens_A > 0 else evaluator.sender_max_tokens
     effective_b_budget = cfg.max_tokens_B if cfg.max_tokens_B > 0 else evaluator.max_tokens
+    method_name = (
+        "textmas" if cfg.do_test_nld
+        else "latent_segmented_dual" if cfg.segmented_kv_select
+        else "latent_legacy_dual" if cfg.dual_kv_select
+        else "latent_selective" if cfg.latent_kv_select
+        else "latent_full"
+    )
     manifest = {
         "schema_version": "v2",
         "metric_version": "v2",
@@ -295,7 +318,7 @@ def main(cfg: LatentAlignConfig):
         "prompt_version": evaluator.prompt_version,
         "sender_input_mode": evaluator.sender_input_mode,
         "primary_metric": evaluator.primary_metric,
-        "method": "textmas" if cfg.do_test_nld else "latent_selective" if cfg.latent_kv_select else "latent_full",
+        "method": method_name,
         "seed": cfg.seed,
         "limit": cfg.limit,
         "model_A": cfg.model_A,
@@ -304,14 +327,25 @@ def main(cfg: LatentAlignConfig):
         "max_tokens_B": effective_b_budget,
         "latent_steps": cfg.latent_steps,
         "selected_layers": cfg.layers_list,
+        "context_layers": None,
+        "latent_layers": None,
+        "batch_size": cfg.batch_size,
+        "allow_b_think": cfg.allow_b_think,
+        "segmented_kv_select": cfg.segmented_kv_select,
+        "legacy_dual_kv_select": cfg.dual_kv_select,
         "temperature": 0.6,
         "top_p": 0.95,
         "do_sample": True,
         "first_sender_core_sha256": hashlib.sha256(sender_core.encode("utf-8")).hexdigest(),
         "first_receiver_core_sha256": hashlib.sha256(receiver_core.encode("utf-8")).hexdigest(),
     }
-    with open(os.path.join(final_snapshot_path, "manifest.json"), "w", encoding="utf-8") as manifest_file:
-        json.dump(manifest, manifest_file, ensure_ascii=False, indent=2)
+    manifest_path = os.path.join(final_snapshot_path, "manifest.json")
+
+    def persist_manifest():
+        with open(manifest_path, "w", encoding="utf-8") as manifest_file:
+            json.dump(manifest, manifest_file, ensure_ascii=False, indent=2)
+
+    persist_manifest()
     logging.info(f"Evaluation profile: {manifest}")
     if cfg.limit == 0:
         cfg.limit = None
@@ -379,6 +413,7 @@ def main(cfg: LatentAlignConfig):
             f"latent_steps={cfg.latent_steps}, "
             f"latent_space_realign={cfg.latent_space_realign}, "
             f"dual_kv_select={cfg.dual_kv_select}, "
+            f"segmented_kv_select={cfg.segmented_kv_select}, "
             f"latent_kv_select={cfg.latent_kv_select}, "
             f"top_layers={cfg.top_layers}, "
             f"random_selection={cfg.random_selection}"
@@ -399,15 +434,186 @@ def main(cfg: LatentAlignConfig):
             A_num_layers = model_A.config.text_config.num_hidden_layers
 
         # ── Validate mutual exclusion ──────────────────────────────────────
-        if cfg.dual_kv_select and cfg.latent_kv_select:
+        selected_modes = sum(bool(flag) for flag in (
+            cfg.dual_kv_select, cfg.segmented_kv_select, cfg.latent_kv_select
+        ))
+        if selected_modes > 1:
             raise ValueError(
-                "--dual_kv_select and --latent_kv_select are mutually exclusive. "
-                "Use --dual_kv_select for Mode 4 (Dual-Selective KV Routing) or "
-                "--latent_kv_select for Mode 2 (uniform KVComm layer selection)."
+                "--dual_kv_select, --segmented_kv_select, and --latent_kv_select "
+                "are mutually exclusive"
             )
 
         # ── Determine layers_list for CVCommunicator ───────────────────
-        if cfg.dual_kv_select:
+        if cfg.segmented_kv_select:
+            if cfg.batch_size != 1:
+                raise ValueError("Mode 5 Segmented Dual-KV currently requires --batch_size 1")
+            if cfg.calib_size < 1:
+                raise ValueError("Mode 5 Segmented Dual-KV requires --calib_size >= 1")
+            if cfg.latent_steps < 1:
+                raise ValueError("Mode 5 Segmented Dual-KV requires --latent_steps >= 1")
+            if not cfg.shift_back:
+                raise ValueError("Mode 5 Segmented Dual-KV requires --shift_back")
+            if not (0.0 < cfg.context_top_ratio <= 1.0):
+                raise ValueError("context_top_ratio must be in (0, 1]")
+            if not (0.0 < cfg.latent_top_ratio <= 1.0):
+                raise ValueError("latent_top_ratio must be in (0, 1]")
+            if (
+                getattr(model_A.config, "model_type", None) != "qwen3"
+                or getattr(model_B.config, "model_type", None) != "qwen3"
+            ):
+                raise NotImplementedError(
+                    "Mode 5 Segmented Dual-KV v1 supports Qwen3 -> Qwen3 only"
+                )
+            if model_A.model.has_sliding_layers or model_B.model.has_sliding_layers:
+                raise NotImplementedError(
+                    "Mode 5 v1 does not support sliding-attention Qwen3 variants"
+                )
+            architecture_fields = (
+                "num_hidden_layers", "hidden_size", "num_attention_heads",
+                "num_key_value_heads", "head_dim", "sliding_window", "layer_types",
+            )
+            mismatched = [
+                field for field in architecture_fields
+                if getattr(model_A.config, field, None) != getattr(model_B.config, field, None)
+            ]
+            if mismatched:
+                raise ValueError(
+                    "Mode 5 requires matching A/B Qwen3 architecture; "
+                    f"mismatched fields: {mismatched}"
+                )
+
+            all_layers = list(range(A_num_layers))
+            logging.info(
+                "Mode 5 calibration: %s sample(s), greedy, full KV, "
+                "independent context/latent attention mass",
+                cfg.calib_size,
+            )
+            cv_calib = CVCommunicator(
+                model_A, model_B,
+                cfg.layer_from, cfg.layer_to,
+                layers_list=all_layers,
+                top_layers=0.0,
+                apply_attn_tracer=True,
+                shift_back=cfg.shift_back,
+                capture_segmented_importance=True,
+            )
+            calibration_evaluator = LatentCommunicationEvaluator(
+                evaluator=evaluator,
+                tokenizer=tokenizer,
+                use_wandb=False,
+                max_input_length=cfg.max_input_length,
+                latent_mas=latent_mas,
+                cv=cv_calib,
+                allow_b_think=cfg.allow_b_think,
+                max_tokens_B=cfg.max_tokens_B,
+                response_log_path=None,
+            )
+            calibration_evaluator.generate_args.update({
+                "do_sample": False,
+                "max_new_tokens": 1,
+            })
+            for sampling_arg in ("temperature", "top_p", "top_k"):
+                calibration_evaluator.generate_args.pop(sampling_arg, None)
+            calibration_start = time.perf_counter()
+            calibration_evaluator.test(
+                model_A,
+                cv_calib,
+                limit=cfg.calib_size,
+                no_wandb=True,
+                do_calc_segmented_importance=True,
+                batch_size=1,
+            )
+            calibration_time = time.perf_counter() - calibration_start
+
+            context_layers, latent_layers, context_scores, latent_scores = (
+                select_segmented_layers(
+                    calibration_evaluator.segmented_importance_total,
+                    cfg.context_top_ratio,
+                    cfg.latent_top_ratio,
+                )
+            )
+            # Calibration examples are intentionally reused by the final run,
+            # but their one-token calibration responses must not contaminate
+            # the reported task metric. Also restore ordinary attention modules
+            # so tracer-held Q/K tensors do not consume memory during evaluation.
+            cv_calib.remove_B_attn_tracer()
+            evaluator = get_evaluator(cfg.test_task)
+            del calibration_evaluator, cv_calib
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            overlap_layers = sorted(set(context_layers) & set(latent_layers))
+            logging.info(
+                "Mode 5 selected context_layers=%s (%s/%s), latent_layers=%s "
+                "(%s/%s), overlap=%s",
+                context_layers, len(context_layers), A_num_layers,
+                latent_layers, len(latent_layers), A_num_layers,
+                overlap_layers,
+            )
+            calibration_record = {
+                "selection": "pure_attention_mass",
+                "normalization": "per_sample_minmax_then_mean",
+                "attention_query_chunk_size": 4,
+                "calib_size": cfg.calib_size,
+                "calibration_samples_reused_in_evaluation": True,
+                "calibration_do_sample": False,
+                "calibration_max_new_tokens": 1,
+                "calibration_time_seconds": calibration_time,
+                "context_top_ratio": cfg.context_top_ratio,
+                "latent_top_ratio": cfg.latent_top_ratio,
+                "context_scores": context_scores,
+                "latent_scores": latent_scores,
+                "context_layers": context_layers,
+                "latent_layers": latent_layers,
+                "overlap_layers": overlap_layers,
+            }
+            with open(
+                os.path.join(final_snapshot_path, "segmented_calibration.json"),
+                "w",
+                encoding="utf-8",
+            ) as calibration_file:
+                json.dump(calibration_record, calibration_file, ensure_ascii=False, indent=2)
+
+            cv = CVCommunicator(
+                model_A, model_B,
+                cfg.layer_from, cfg.layer_to,
+                layers_list=all_layers,
+                top_layers=0.0,
+                apply_attn_tracer=False,
+                shift_back=True,
+                segmented_context_layers=context_layers,
+                segmented_latent_layers=latent_layers,
+            )
+            latent_evaluator = LatentCommunicationEvaluator(
+                evaluator=evaluator,
+                tokenizer=tokenizer,
+                use_wandb=cfg.use_wandb,
+                max_input_length=cfg.max_input_length,
+                latent_mas=latent_mas,
+                cv=cv,
+                allow_b_think=cfg.allow_b_think,
+                max_tokens_B=cfg.max_tokens_B,
+                response_log_path=response_log_path,
+            )
+            manifest.update({
+                "method": "latent_segmented_dual",
+                "selected_layers": None,
+                "context_layers": context_layers,
+                "latent_layers": latent_layers,
+                "overlap_layers": overlap_layers,
+                "context_top_ratio": cfg.context_top_ratio,
+                "latent_top_ratio": cfg.latent_top_ratio,
+                "calibration": calibration_record,
+            })
+            persist_manifest()
+            results = latent_evaluator.test(
+                model_A, cv, limit=cfg.limit, batch_size=1
+            )
+            manifest["evaluation_time_seconds"] = latent_evaluator.last_time_used
+            manifest["segmented_stats"] = latent_evaluator.get_segmented_stats_summary()
+            persist_manifest()
+
+        elif cfg.dual_kv_select:
             # ── Mode 4: §3.1 Dual-Selective KV Routing ──────────────────
             context_layers, latent_layers = CVCommunicator.get_dual_layers_list(
                 A_num_layers,
@@ -416,6 +622,13 @@ def main(cfg: LatentAlignConfig):
                 latent_top_ratio=cfg.latent_top_ratio,
             )
             dual_layers_list = sorted(set(context_layers) | set(latent_layers))
+            manifest.update({
+                "method": "latent_legacy_dual",
+                "selected_layers": dual_layers_list,
+                "context_layers": context_layers,
+                "latent_layers": latent_layers,
+            })
+            persist_manifest()
             logging.info(
                 f"Mode 4 (Dual-Selective KV Routing): "
                 f"A_num_layers={A_num_layers}, split_ratio={cfg.split_ratio}, "
@@ -440,7 +653,6 @@ def main(cfg: LatentAlignConfig):
                 max_input_length=cfg.max_input_length,
                 latent_mas=latent_mas,
                 cv=cv,
-                latent_only=cfg.latent_only,
                 allow_b_think=cfg.allow_b_think,
                 max_tokens_B=cfg.max_tokens_B,
                 response_log_path=response_log_path,
@@ -476,7 +688,6 @@ def main(cfg: LatentAlignConfig):
                 max_input_length=cfg.max_input_length,
                 latent_mas=latent_mas,
                 cv=cv,
-                latent_only=cfg.latent_only,
                 allow_b_think=cfg.allow_b_think,
                 max_tokens_B=cfg.max_tokens_B,
                 response_log_path=response_log_path,
@@ -510,7 +721,6 @@ def main(cfg: LatentAlignConfig):
                     max_input_length=cfg.max_input_length,
                     latent_mas=latent_mas,
                     cv=cv,
-                    latent_only=cfg.latent_only,
                     allow_b_think=cfg.allow_b_think,
                     max_tokens_B=cfg.max_tokens_B,
                     response_log_path=response_log_path,
@@ -548,7 +758,6 @@ def main(cfg: LatentAlignConfig):
                     max_input_length=cfg.max_input_length,
                     latent_mas=latent_mas,
                     cv=cv_calib,
-                    latent_only=cfg.latent_only,
                     allow_b_think=cfg.allow_b_think,
                     max_tokens_B=cfg.max_tokens_B,
                     response_log_path=response_log_path,
@@ -637,7 +846,6 @@ def main(cfg: LatentAlignConfig):
                     max_input_length=cfg.max_input_length,
                     latent_mas=latent_mas,
                     cv=cv,
-                    latent_only=cfg.latent_only,
                     allow_b_think=cfg.allow_b_think,
                     max_tokens_B=cfg.max_tokens_B,
                     response_log_path=response_log_path,

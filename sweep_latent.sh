@@ -41,14 +41,15 @@ Modes:
   m1 | full_kv                 Full-KV LatentMAS
   m2 | selective_kv            Selective-KV LatentMAS
   m3 | kvcomm                  Regular KVComm, no latent steps
-  m4 | dual_kv                 Dual-selective KV routing
+  m4 | dual_kv                 Legacy depth-split routing (full KV per kept layer)
+  m5 | segmented_kv            Segmented Dual-KV (independent context/latent routing)
   textmas | tx                 TextMAS baseline
   both                         m1 + m2
-  all                          m3 + textmas + m1 + m2 + m4
+  all                          m3 + textmas + m1 + m2 + m4 + m5
 
 Sweep options:
   --task, --tasks VALUE         all|core|qa|math|code|mcq or "task1 task2"
-  --steps "1 2 5 10"          Latent steps for m1/m2/m4 (default: 10)
+  --steps "1 2 5 10"          Latent steps for m1/m2/m4/m5 (default: 10)
   --mode MODE                  One of the modes above
   --limit N                    0 means full dataset
   --dry_run                    Print every command without running models
@@ -69,6 +70,7 @@ Layer selection:
 Examples:
   bash sweep_latent.sh --task "hotpotqa tmath" --steps "1 2 5" --mode both --dry_run
   bash sweep_latent.sh --task qa --mode all --steps "1 5" --limit 10
+  bash sweep_latent.sh --task "hotpotqa tmath" --mode m5 --steps "5 10" --limit 10
   bash sweep_latent.sh --task multifieldqa_en --mode textmas --max_tokens_A 256 --max_tokens_B 64
 EOF
 }
@@ -110,8 +112,9 @@ case "$MODE" in
   2|selective_kv) MODE=m2 ;;
   3|kvcomm) MODE=m3 ;;
   4|dual_kv) MODE=m4 ;;
+  5|segmented_kv|segmented_dual_kv) MODE=m5 ;;
   tx|nld) MODE=textmas ;;
-  m1|m2|m3|m4|textmas|both|all) ;;
+  m1|m2|m3|m4|m5|textmas|both|all) ;;
   *) echo "[ERROR] Unsupported mode: $MODE" >&2; exit 2 ;;
 esac
 
@@ -165,7 +168,7 @@ resolve_b_think() {
 declare -a MODES
 case "$MODE" in
   both) MODES=(m1 m2) ;;
-  all) MODES=(m3 textmas m1 m2 m4) ;;
+  all) MODES=(m3 textmas m1 m2 m4 m5) ;;
   *) MODES=("$MODE") ;;
 esac
 
@@ -202,6 +205,12 @@ run_one() {
         --split_ratio "$SPLIT_RATIO" --context_top_ratio "$CONTEXT_TOP_RATIO" --latent_top_ratio "$LATENT_TOP_RATIO")
       [[ "$TRACK_CONVERGENCE" == true ]] && args+=(--track_convergence)
       ;;
+    m5)
+      args+=(--do_test_latent --segmented_kv_select --latent_steps "$step"
+        --context_top_ratio "$CONTEXT_TOP_RATIO" --latent_top_ratio "$LATENT_TOP_RATIO"
+        --calib_size "$CALIB_SIZE")
+      [[ "$TRACK_CONVERGENCE" == true ]] && args+=(--track_convergence)
+      ;;
     textmas) args+=(--do_test_nld --max_tokens_A "$MAX_TOKENS_A") ;;
   esac
 
@@ -224,7 +233,7 @@ echo "Budgets: A=$MAX_TOKENS_A (TextMAS) | B=$MAX_TOKENS_B | B-thinking=$ALLOW_B
 
 for task in "${TASKS[@]}"; do
   for mode in "${MODES[@]}"; do
-    if [[ "$mode" == m1 || "$mode" == m2 || "$mode" == m4 ]]; then
+    if [[ "$mode" == m1 || "$mode" == m2 || "$mode" == m4 || "$mode" == m5 ]]; then
       for step in "${LATENT_STEPS[@]}"; do run_one "$task" "$mode" "$step"; done
     else
       run_one "$task" "$mode"

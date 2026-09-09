@@ -12,8 +12,8 @@ Extends CommunicationEvaluator with the following changes vs KVComm original:
 
   2. inference() [OVERRIDE]:
        - Replaces model(input_ids_A) with latent_mas.run(input_ids_A)
-       - Passes latent_only flag to control whether only latent tokens or
-         full T+N tokens are forwarded to model_B
+       - Always produces the full T+N sender cache. Segmented Dual-KV performs
+         any context/latent reduction later, per layer, in CVCommunicator.
        - max_new_tokens is sourced from evaluator.max_tokens, which is set
          per-evaluator class:
            MedQAEvaluator    →  512
@@ -47,9 +47,11 @@ import json
 import time
 import logging
 import torch
+from collections import defaultdict
 from tqdm import tqdm
 from eval import CommunicationEvaluator, apply_chat_template, is_think_model
 from layer_importance import calc_layer_importance
+from segmented_kv import accumulate_segment_masses
 from models_latent import LatentMAS
 from models import CVCommunicator
 from prompts_latent import build_latent_sender_msg, build_latent_receiver_msg, build_text_receiver_msg
@@ -69,9 +71,8 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
       Mode 1: cv.layers_list = all layers  -> no layer selection
       Mode 2: cv.layers_list = subset      -> KVComm layer selection applied
 
-    latent_only flag (controls token selection inside LatentMAS.run):
-      False: B receives A's full T_input + N_latent KV tokens
-      True:  B receives only the last N_latent KV tokens (compressed thoughts)
+    Segmented Dual-KV keeps independent context/latent layer sets inside
+    CVCommunicator; LatentMAS itself always returns the full input+latent cache.
     """
 
     def __init__(
@@ -82,7 +83,6 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
         max_input_length: int,
         latent_mas: LatentMAS,
         cv: CVCommunicator,
-        latent_only: bool = False,
         allow_b_think: bool = False,
         max_tokens_B: int = 0,
         response_log_path: str = None,
@@ -95,9 +95,6 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
             max_input_length: Maximum combined token length before truncation.
             latent_mas:       LatentMAS instance wrapping model_A.
             cv:               CVCommunicator(model_A, model_B, ...).
-            latent_only:      If True, only the latent_steps KV tokens are
-                              forwarded to B (discard T_input prefix).
-                              Default False preserves backward-compatible behaviour.
             allow_b_think:    If True, allows receiver B to think instead of suppressing
                               thinking with </think>\n\nThe answer is: (Fix Bug B1).
                               Only applies in LatentMAS mode (this evaluator).
@@ -120,8 +117,15 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
         )
 
         self.latent_mas = latent_mas
-        self.latent_only = latent_only
         self.allow_b_think = allow_b_think
+        self.segmented_importance_total = {
+            "context": defaultdict(list),
+            "latent": defaultdict(list),
+        }
+        self.last_context_length = None
+        self.last_latent_length = None
+        self.last_segmented_stats = None
+        self.segmented_stats_history = []
         self.name = "latent_communication"
 
         # ── Max output tokens for B (LatentMAS-only override) ──────────────
@@ -145,7 +149,7 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
             f"latent_steps={latent_mas.latent_steps}, "
             f"latent_space_realign={latent_mas.latent_space_realign}, "
             f"layers_list={cv.layers_list}, "
-            f"latent_only={latent_only}, "
+            f"segmented={cv.segmented_kv}, "
             f"allow_b_think={allow_b_think}, "
             f"max_new_tokens={effective_max_tokens} "
             f"({'override' if max_tokens_B > 0 else 'from evaluator'}), "
@@ -264,7 +268,7 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
 
     # ------------------------------------------------------------------
     # Override 2: inference
-    # Uses updated prepare_input_ids + latent_only flag (fix vấn đề 7)
+    # Uses updated prepare_input_ids and full input+latent cache.
     # ------------------------------------------------------------------
 
     def inference(self, model, cv, item):
@@ -274,7 +278,7 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
         Changes vs CommunicationEvaluator.inference():
           1. prepare_input_ids() now uses latent-aware prompts (overridden above).
           2. Sender uses latent_mas.run() instead of model(input_ids_A).
-          3. latent_only flag controls whether B receives only latent KV tokens.
+          3. CVCommunicator optionally applies per-segment routing.
 
         Args:
             model: model_A (passed by _test(), kept for API compatibility).
@@ -291,13 +295,14 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
         # ── Latent thinking ───────────────────────────────────────────────
         # Replace: out_A = model(input_ids_A, use_cache=True)
         # With:    latent loop on model_A → DynamicCache
-        #
-        # latent_only=True  → DynamicCache[i]: [1, kv_heads, N,   head_dim]
-        # latent_only=False → DynamicCache[i]: [1, kv_heads, T+N, head_dim]
         latent_past_kv = self.latent_mas.run(
             input_ids_A,
             attention_mask=torch.ones_like(input_ids_A),
-            latent_only=self.latent_only,
+        )
+        self.last_context_length = int(input_ids_A.shape[-1])
+        self.last_latent_length = int(self.latent_mas.latent_steps)
+        cv.configure_segmented_attention_capture(
+            self.last_context_length, self.last_latent_length
         )
 
         # ── FIX: prepend past_mask cho attention_mask của B ───────────────
@@ -330,6 +335,7 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
             out_A_past_key_values=latent_past_kv,
             **self.generate_args,
         )[0]
+        self.last_segmented_stats = getattr(cv, "last_segmented_stats", None)
 
         context_length = input_ids_B.shape[-1]
         return self.get_response(output, context_length)
@@ -373,7 +379,6 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
         latent_past_kv = self.latent_mas.run(
             input_ids_A,
             attention_mask=attention_mask_A,
-            latent_only=self.latent_only,
         )
 
         # 4. Left-padding input_ids_B for Receiver B CausalLM generation
@@ -388,15 +393,10 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
 
         # 5. Build past_mask for A's KV cache
         # past_mask logic:
-        # If latent_only=True, cache is fixed length N_latent (all active).
-        # If latent_only=False, cache includes A's original KV (padded to max_len_A) + N_latent.
-        # We must mask out padding tokens from A (attention_mask_A) so B does not attend to them.
+        # Cache includes A's padded input KV plus N latent tokens.  Mask A padding.
         N_latent = self.latent_mas.latent_steps
-        if self.latent_only:
-            past_mask = torch.ones((batch_size, N_latent), dtype=torch.long, device=cv.B.device)
-        else:
-            latent_ones = torch.ones((batch_size, N_latent), dtype=torch.long, device=cv.B.device)
-            past_mask = torch.cat([attention_mask_A.to(cv.B.device), latent_ones], dim=1)
+        latent_ones = torch.ones((batch_size, N_latent), dtype=torch.long, device=cv.B.device)
+        past_mask = torch.cat([attention_mask_A.to(cv.B.device), latent_ones], dim=1)
 
         attention_mask_B = torch.cat([past_mask, attention_mask_B_tokens], dim=1)
 
@@ -419,7 +419,10 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
 
         return responses
 
-    def _test(self, model_A, cv=None, limit=None, do_calc_layer_importance=False, batch_size=1):
+    def _test(
+        self, model_A, cv=None, limit=None, do_calc_layer_importance=False,
+        do_calc_segmented_importance=False, batch_size=1,
+    ):
         if cv is None:
             return super()._test(model_A, limit=limit, do_calc_layer_importance=do_calc_layer_importance)
 
@@ -427,26 +430,27 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
         if limit is not None:
             items_all = items_all[:limit]
 
-        progress_bar = tqdm(range(0, len(items_all), batch_size), desc=f"{self.name} result: 0.0000", disable=do_calc_layer_importance)
+        if cv.segmented_kv and batch_size != 1:
+            raise ValueError("Segmented Dual-KV currently requires batch_size=1")
+        collecting_importance = do_calc_layer_importance or do_calc_segmented_importance
+        progress_bar = tqdm(
+            range(0, len(items_all), batch_size),
+            desc=f"{self.name} result: 0.0000",
+            disable=collecting_importance,
+        )
 
         # ── Open response log file (mirrors CommunicationEvaluator pattern) ──
         response_log_file = None
-        if self.response_log_path and not do_calc_layer_importance:
+        if self.response_log_path and not collecting_importance:
             response_log_file = open(self.response_log_path, "a", encoding="utf-8")
 
         # Meta fields written to every log record for easy filtering in debug
-        _mode_tag = (
-            f"latent_only={self.latent_only}"
-            f"|allow_b_think={self.allow_b_think}"
-            f"|N={self.latent_mas.latent_steps}"
-        )
-
         try:
             for start_idx in progress_bar:
                 batch_items = items_all[start_idx : start_idx + batch_size]
                 # When computing layer importance, always use single-item inference to
                 # get per-item attention weights via cv.calc_attn_weights_from_qk()
-                if len(batch_items) > 1 and not do_calc_layer_importance:
+                if len(batch_items) > 1 and not collecting_importance:
                     responses = self.inference_batch(cv, batch_items)
                 else:
                     responses = [self.inference(model_A, cv, item) for item in batch_items]
@@ -456,8 +460,15 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
                     self.layer_importance_total = calc_layer_importance(
                         cv.B_attn_weights, model_A.name, self.layer_importance_total
                     )
+                if do_calc_segmented_importance:
+                    self.segmented_importance_total = accumulate_segment_masses(
+                        cv.get_segmented_attention_masses(),
+                        totals=self.segmented_importance_total,
+                    )
 
                 for i, (item, resp) in enumerate(zip(batch_items, responses)):
+                    if cv.segmented_kv and self.last_segmented_stats and not collecting_importance:
+                        self.segmented_stats_history.append(dict(self.last_segmented_stats))
                     # resp = clean answer (thinking trace stripped by get_response override)
                     item_metrics = self.evaluator.evaluate_item(item, resp) or {}
 
@@ -467,12 +478,24 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
                     # ── Write to responses.jsonl ────────────────────────────
                     if response_log_file is not None:
                         logged_ids_a, logged_ids_b = self.prepare_input_ids(item, cv.A, cv.B)
-                        selected_layers = list(cv.layers_list) if cv.layers_list is not None else None
+                        selected_layers = (
+                            None if cv.segmented_kv
+                            else list(cv.layers_list) if cv.layers_list is not None
+                            else None
+                        )
                         total_layers = getattr(cv.A.config, "num_hidden_layers", None)
-                        is_selective = bool(selected_layers) and total_layers is not None and len(selected_layers) < total_layers
+                        is_selective = cv.segmented_kv or (
+                            bool(selected_layers) and total_layers is not None
+                            and len(selected_layers) < total_layers
+                        )
+                        method = (
+                            "latentmas_segmented_dual_kv" if cv.segmented_kv
+                            else "latentmas_selective_kv" if is_selective
+                            else "latentmas_full_kv"
+                        )
                         record = build_response_record(
                             idx=start_idx + i, evaluator=self.evaluator, item=item,
-                            method="latentmas_selective_kv" if is_selective else "latentmas_full_kv",
+                            method=method,
                             response=resp,
                             model_a_prompt=self.tokenizer.decode(logged_ids_a[0], skip_special_tokens=False),
                             model_b_prompt=self.tokenizer.decode(logged_ids_b[0], skip_special_tokens=False),
@@ -481,8 +504,15 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
                             generated_tokens_a=self.latent_mas.latent_steps,
                             generated_tokens_b=len(self.tokenizer.encode(resp, add_special_tokens=False)),
                             communication_type="latent_kv", latent_steps=self.latent_mas.latent_steps,
-                            layer_selection_mode="selected" if is_selective else "full",
+                            layer_selection_mode=(
+                                "segmented" if cv.segmented_kv
+                                else "selected" if is_selective
+                                else "full"
+                            ),
                             selected_layers=selected_layers,
+                            context_layers=cv.segmented_context_layers,
+                            latent_layers=cv.segmented_latent_layers,
+                            segmented_stats=self.last_segmented_stats,
                         )
                         response_log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
                         response_log_file.flush()
@@ -495,18 +525,51 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
 
 
     @torch.no_grad()
-    def test(self, model_A, cv, limit=None, no_wandb=False, do_calc_layer_importance=False, batch_size=1):
+    def test(
+        self, model_A, cv, limit=None, no_wandb=False,
+        do_calc_layer_importance=False, do_calc_segmented_importance=False,
+        batch_size=1,
+    ):
         tic = time.time()
-        result = self._test(model_A, cv, limit=limit, do_calc_layer_importance=do_calc_layer_importance, batch_size=batch_size)
+        result = self._test(
+            model_A, cv, limit=limit,
+            do_calc_layer_importance=do_calc_layer_importance,
+            do_calc_segmented_importance=do_calc_segmented_importance,
+            batch_size=batch_size,
+        )
         toc = time.time()
         time_used = toc - tic
+        self.last_time_used = time_used
 
-        if self.use_wandb and not no_wandb and not do_calc_layer_importance:
+        if self.use_wandb and not no_wandb and not (
+            do_calc_layer_importance or do_calc_segmented_importance
+        ):
             import wandb
             wandb.log({f"{self.name}_{key}": value for key, value in self.evaluator.get_results().items() if isinstance(value, (int, float))})
             wandb.log({f"{self.name}_time": time_used})
         logging.info(f"{self.name} result: {result:.4f}, {self.name} time: {time_used:.2f}s")
         return result
+
+    def get_segmented_stats_summary(self):
+        if not self.segmented_stats_history:
+            return None
+        numeric_keys = (
+            "actual_tensor_bytes",
+            "full_tensor_bytes",
+            "byte_retention_ratio",
+            "context_length",
+            "latent_length",
+            "full_kv_token_positions",
+            "retained_kv_token_positions",
+            "logical_retention_ratio",
+        )
+        summary = {
+            f"mean_{key}": sum(float(row[key]) for row in self.segmented_stats_history)
+            / len(self.segmented_stats_history)
+            for key in numeric_keys
+        }
+        summary["num_samples"] = len(self.segmented_stats_history)
+        return summary
 
 
 # ──────────────────────────────────────────────────────────────────────────────

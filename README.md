@@ -257,6 +257,34 @@ python com_latent.py \
     --shift_back
 ```
 
+#### Mode 4 — Legacy Dual-KV depth split
+
+Mode 4 is retained for comparison with earlier experiments. It chooses shallow
+and deep layer groups, unions them, and transfers the full context+latent cache
+at each retained layer. It does not route the two token segments separately.
+
+#### Mode 5 — Segmented Dual-KV
+
+```bash
+python com_latent.py \
+    --model_A Qwen/Qwen3-4B \
+    --model_B Qwen/Qwen3-4B \
+    --test_task hotpotqa \
+    --do_test_latent \
+    --segmented_kv_select \
+    --latent_steps 10 \
+    --context_top_ratio 0.7 \
+    --latent_top_ratio 0.7 \
+    --calib_size 5 \
+    --batch_size 1 \
+    --shift_back
+```
+
+Mode 5 independently ranks context and latent attention mass, keeps
+`floor(ratio × number_of_layers)` layers for each segment, and preserves the
+original attention sink everywhere. V1 requires matching full-attention Qwen3
+architectures and `batch_size=1`.
+
 
 
 ### Runinng Thinking Model :
@@ -272,12 +300,15 @@ python com_latent.py --model_A suayptalha/DeepSeek-R1-Distill-Llama-3B --model_B
 | `--device` | str | `"cuda:0"` | Primary GPU device (or device for `model_A`). Supports `"cuda:0"`, `"auto"`, etc. |
 | `--device_B` | str | `""` | Device for `model_B`. If empty, defaults to `--device`. Supports multi-GPU (e.g. `--device cuda:0 --device_B cuda:1`) |
 | `--latent_steps` | int | `5` | Number of latent thinking iterations. Lower = less degeneration (recommended: 5–10) |
-| `--latent_space_realign` | flag | `False` | Apply realignment matrix W to project hidden states back to embedding space between steps |
+| `--no_latent_space_realign` | flag | disabled | Disable the default realignment matrix W between latent steps |
 | `--latent_kv_select` | flag | `False` | Enable Mode 2: filter KV cache by layer importance before passing to B |
-| `--latent_only` | flag | `False` | ⚠️ Experimental: pass only the N latent KV tokens (discard input tokens). Causes RoPE mismatch — do not use |
-| `--calib_size` | int | `1` | Number of calibration samples for layer ranking. Use ≥5 for reliable rankings |
+| `--dual_kv_select` | flag | `False` | Enable legacy Mode 4 depth-split layer selection |
+| `--segmented_kv_select` | flag | `False` | Enable Mode 5 independent context/latent segment routing |
+| `--calib_size` | int | `5` | Number of calibration samples for layer ranking |
 | `--shift_back` | flag | `False` | Fix RoPE position mismatch for attention-sink-only layers. **Always enable with latent** |
 | `--top_layers` | float | `0.0` | Fraction of top-importance layers to keep (e.g., `0.7` = keep top 70%) |
+| `--context_top_ratio` | float | `0.7` | Mode 5 fraction of layers retaining context KV |
+| `--latent_top_ratio` | float | `0.7` | Mode 5 fraction of layers retaining latent KV |
 | `--layers_list` | int[] | `[-1]` | Manual layer list for MANUAL sub-mode |
 | `--random_selection` | flag | `False` | Random layer selection (ablation baseline) |
 
@@ -290,6 +321,8 @@ python com_latent.py --model_A suayptalha/DeepSeek-R1-Distill-Llama-3B --model_B
 | KVComm (no latent) | `--do_test` | ❌ | ✅ | ~0.60 |
 | LatentMAS standalone | `--do_test_latent` | ✅ | ❌ | ~0.35 |
 | **LatentMAS + KVComm** | `--do_test_latent --latent_kv_select` | ✅ | ✅ | **TBD** |
+| Legacy Dual-KV | `--do_test_latent --dual_kv_select` | ✅ | ✅ (whole layer) | **TBD** |
+| **Segmented Dual-KV** | `--do_test_latent --segmented_kv_select` | ✅ | ✅ (per segment) | **TBD** |
 
 ### Output Files
 
@@ -298,34 +331,41 @@ Each run creates a timestamped snapshot directory under `snapshots/`:
 ```
 snapshots/
 └── llama3.23binstruct-to-llama3.23binstruct_top0.7_lat5_realign_kvsel_MMDD_HHMM/
-    ├── log.log          # Run config, calibration results, final scores
-    └── responses.jsonl  # Per-sample: prompt_a, prompt_b, response, answer, result_so_far
+    ├── log.log                       # Run config and final score
+    ├── manifest.json                 # Reproducibility metadata and aggregate stats
+    ├── segmented_calibration.json    # Mode-5 scores and selected layer sets
+    └── latent_responses.jsonl        # Per-sample output and routing statistics
 ```
 
-`responses.jsonl` format (one JSON per line):
+`latent_responses.jsonl` format (one schema-v2 JSON object per line):
 ```json
 {
+  "schema_version": "v2",
   "idx": 42,
-  "prompt_a": "...",
-  "prompt_b": "...",
+  "method": "latentmas_segmented_dual_kv",
   "response": "...",
-  "answer": "...",
-  "result_so_far": 0.3571
+  "answers": ["..."],
+  "item_metrics": {"longbench_qa_f1": 0.75},
+  "latent": {
+    "steps": 10,
+    "layer_selection_mode": "segmented",
+    "context_layers": [0, 1],
+    "latent_layers": [1, 2],
+    "segmented_stats": {"byte_retention_ratio": 0.70}
+  }
 }
 ```
 
 ### Evaluation Metric
 
-HotpotQA uses **token-level F1** with a 0.5 threshold:
+HotpotQA uses continuous **LongBench token-level F1**:
 
 ```
-result = mean over all samples of f1_match(answer, response)
-
-f1_match = True  (score 1.0)  if word-overlap F1 > 0.5
-         = False (score 0.0)  otherwise
+result = mean over all samples of token_overlap_f1(answer, response)
 ```
 
-Words are lowercased, punctuation-stripped, and lemmatized before comparison.
+Each sample contributes a fractional score from 0 to 1. The old thresholded
+score remains available as `legacy_accuracy`, but it is not the primary metric.
 ## Evaluation protocol v2 (two-agent adaptation)
 
 New runs use explicit evaluator metadata instead of task-flag fallbacks. This is

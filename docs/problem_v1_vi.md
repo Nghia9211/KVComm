@@ -112,4 +112,8 @@ Khẳng định cho rằng bước prefill của Mode 1 bị lệch nghiêm tr�
 4. Sửa padding mask của vòng lặp ẩn trước khi thực hiện bất kỳ thử nghiệm chạy theo batch nào (B3).
 5. Xóa hoặc viết lại đường đi `latent_only` / `_seen_tokens` (N1, N3) — vừa bị hỏng *vừa* bị âm thầm bỏ qua, điều này làm mất hiệu lực của nó như một thử nghiệm ablation.
 
+**Trạng thái implement (2026-09-09):** đường đi và cờ CLI `latent_only` toàn cục
+đã được xóa. Mode 5 định tuyến rõ từng segment context/latent tại mỗi layer,
+đồng thời giữ attention-sink gốc và vị trí RoPE logic.
+
 **Hệ quả đối với các phát biểu vấn đề ở trên**: P2 (lệch biểu diễn ẩn) một phần là *hệ quả do đo lường* (measurement artifact) — B1/B2 làm thổi phồng độ lệch nhìn thấy; đường cong suy thoái nội tại thực sự vẫn chưa biết cho đến khi chúng được sửa. P5 (sai lệch RoPE) tồi tệ hơn những gì được ghi chép lại: cả hai biện pháp giảm thiểu được tuyên bố (N1, N2) đều không hiệu quả, và khoảng cách Mode 1 > Mode 2 của F4 có thể giải thích một phần bởi B4 thay vì do mất mát thông tin từ việc tỉa bớt lớp.

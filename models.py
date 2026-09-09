@@ -1,5 +1,6 @@
 from typing import Literal, Optional
 import copy
+import inspect
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,6 +14,7 @@ from transformers.models.llama.modeling_llama import LlamaAttention, LlamaModel,
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, Qwen2Model
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention, Qwen3Model
 from transformers.models.gemma3.modeling_gemma3 import Gemma3Attention
+from segmented_kv import logical_retention, slice_segmented_kv
 
 def get_layer_map(L_A, L_B):
     layer_map = {}
@@ -31,6 +33,9 @@ class CVCommunicator(PreTrainedModel, GenerationMixin):
         layers_list: list[int] = [],
         apply_attn_tracer: bool = False,
         shift_back: bool = False,
+        segmented_context_layers: Optional[list[int]] = None,
+        segmented_latent_layers: Optional[list[int]] = None,
+        capture_segmented_importance: bool = False,
     ) -> None:
         super().__init__(model_B.config)
         self.A = model_A
@@ -39,6 +44,22 @@ class CVCommunicator(PreTrainedModel, GenerationMixin):
         self.layer_to = layer_to
         self.apply_attn_tracer = apply_attn_tracer
         self.shift_back = shift_back
+        self.capture_segmented_importance = capture_segmented_importance
+        self.segmented_kv = (
+            segmented_context_layers is not None or segmented_latent_layers is not None
+        )
+        if self.segmented_kv and (
+            segmented_context_layers is None or segmented_latent_layers is None
+        ):
+            raise ValueError(
+                "segmented_context_layers and segmented_latent_layers must be provided together"
+            )
+        self.segmented_context_layers = (
+            sorted(set(segmented_context_layers or [])) if self.segmented_kv else None
+        )
+        self.segmented_latent_layers = (
+            sorted(set(segmented_latent_layers or [])) if self.segmented_kv else None
+        )
         for p in self.A.parameters(): p.requires_grad = False
         for p in self.B.parameters(): p.requires_grad = False
 
@@ -69,11 +90,55 @@ class CVCommunicator(PreTrainedModel, GenerationMixin):
 
         self.layer_map = get_layer_map(self.A_num_layers, self.B_num_layers)
 
+        if self.segmented_kv:
+            if self.A_num_layers != self.B_num_layers:
+                raise ValueError(
+                    "Segmented Dual-KV v1 requires A and B to have the same number of layers"
+                )
+            if type(self.A.model) is not Qwen3Model or type(self.B.model) is not Qwen3Model:
+                raise NotImplementedError(
+                    "Segmented Dual-KV v1 currently requires Qwen3 for both A and B"
+                )
+            if self.A.model.has_sliding_layers or self.B.model.has_sliding_layers:
+                raise NotImplementedError(
+                    "Segmented Dual-KV v1 does not support sliding-attention layers"
+                )
+            architecture_fields = (
+                "hidden_size", "num_attention_heads", "num_key_value_heads", "head_dim",
+                "sliding_window", "layer_types",
+            )
+            mismatched = [
+                field for field in architecture_fields
+                if getattr(self.A.config, field, None) != getattr(self.B.config, field, None)
+            ]
+            if mismatched:
+                raise ValueError(
+                    "Segmented Dual-KV v1 requires matching A/B Qwen3 architecture; "
+                    f"mismatched fields: {mismatched}"
+                )
+            if not self.shift_back:
+                raise ValueError(
+                    "Segmented Dual-KV requires shift_back=True for position-aware routing"
+                )
+            valid = set(range(self.A_num_layers))
+            invalid = (
+                set(self.segmented_context_layers) | set(self.segmented_latent_layers)
+            ) - valid
+            if invalid:
+                raise ValueError(f"invalid segmented layer ids: {sorted(invalid)}")
+
+        if capture_segmented_importance and not apply_attn_tracer:
+            raise ValueError("segmented importance capture requires apply_attn_tracer=True")
         if apply_attn_tracer:
             self.B_attn_weights = {}
             self.apply_B_attn_tracer()
 
-        logging.info(f"CVCommunicator initialized")
+        logging.info(
+            "CVCommunicator initialized: segmented=%s, context_layers=%s, latent_layers=%s",
+            self.segmented_kv,
+            self.segmented_context_layers,
+            self.segmented_latent_layers,
+        )
 
     @staticmethod
     def get_dual_layers_list(
@@ -176,6 +241,66 @@ class CVCommunicator(PreTrainedModel, GenerationMixin):
             else:
                 raise ValueError(f"Unsupported attention module: {type(old)}")
 
+    def remove_B_attn_tracer(self):
+        """Restore standard attention modules after calibration.
+
+        Tracers retain the latest Q/K tensors for offline attention scoring.
+        Replacing them before the full evaluation releases those references and
+        avoids paying the calibration memory overhead on every sample.
+        """
+        if hasattr(self.B.model, "language_model"):
+            layers = self.B.model.language_model.layers
+        else:
+            layers = self.B.model.layers
+        replacements = {
+            LlamaAttentionTracer: LlamaAttention,
+            Qwen2AttentionTracer: Qwen2Attention,
+            Qwen3AttentionTracer: Qwen3Attention,
+            Gemma3AttentionTracer: Gemma3Attention,
+        }
+        for block in layers:
+            old = block.self_attn
+            standard_class = replacements.get(type(old))
+            if standard_class is None:
+                continue
+            device = next(old.parameters()).device
+            dtype = next(old.parameters()).dtype
+            new = standard_class(old.config, old.layer_idx).to(device, dtype)
+            new.load_state_dict(old.state_dict(), strict=True)
+            block.self_attn = new
+        self.apply_attn_tracer = False
+        self.B_attn_weights = {}
+
+    def configure_segmented_attention_capture(self, context_length: int, latent_length: int):
+        """Reset scalar attention-mass capture for the next B prefill."""
+        if not self.capture_segmented_importance:
+            return
+        if hasattr(self.B.model, "language_model"):
+            layers = self.B.model.language_model.layers
+        else:
+            layers = self.B.model.layers
+        for block in layers:
+            attention = block.self_attn
+            if type(attention) is not Qwen3AttentionTracer:
+                raise TypeError("Mode 5 calibration requires Qwen3AttentionTracer")
+            attention.segment_boundaries = (int(context_length), int(latent_length))
+            attention.segment_masses = None
+            attention.attn_inputs = None
+
+    def get_segmented_attention_masses(self):
+        """Collect the two captured scalar masses from every B layer."""
+        if hasattr(self.B.model, "language_model"):
+            layers = self.B.model.language_model.layers
+        else:
+            layers = self.B.model.layers
+        masses = {}
+        for layer, block in enumerate(layers):
+            layer_masses = getattr(block.self_attn, "segment_masses", None)
+            if layer_masses is None:
+                raise RuntimeError(f"no segmented attention mass captured for layer {layer}")
+            masses[layer] = dict(layer_masses)
+        return masses
+
     def get_layer_device(self, layer_idx: int):
         try:
             if hasattr(self.B, "model") and hasattr(self.B.model, "layers"):
@@ -187,6 +312,8 @@ class CVCommunicator(PreTrainedModel, GenerationMixin):
         return next(self.B.parameters()).device
 
     def prepare_key_cache(self, past_key_values):
+        if self.segmented_kv:
+            return self.prepare_segmented_key_cache(past_key_values)
         key_cache = past_key_values.key_cache
         value_cache = past_key_values.value_cache
         assert len(key_cache) == len(self.layer_map), "key_cache and layer_map must have the same length"
@@ -205,44 +332,139 @@ class CVCommunicator(PreTrainedModel, GenerationMixin):
                 past_key_values_new.update(key_cache_i, value_cache_i, target_layer_b)
         return past_key_values_new
 
+    def prepare_segmented_key_cache(self, past_key_values):
+        """Physically route input and latent KV segments independently per layer."""
+        context_length = getattr(past_key_values, "_kvcomm_context_length", None)
+        latent_length = getattr(past_key_values, "_kvcomm_latent_length", None)
+        logical_length = getattr(past_key_values, "_kvcomm_logical_length", None)
+        if context_length is None or latent_length is None or logical_length is None:
+            raise ValueError(
+                "Segmented Dual-KV requires cache boundaries produced by LatentMAS.run()"
+            )
+        if past_key_values.key_cache[0].shape[0] != 1:
+            raise ValueError("Segmented Dual-KV v1 requires batch_size=1")
+
+        context_set = set(self.segmented_context_layers)
+        latent_set = set(self.segmented_latent_layers)
+        routed = DynamicCache()
+        states = {}
+        prefix_lengths = {}
+        actual_bytes = 0
+        full_bytes = 0
+        for source_layer, (key, value) in enumerate(zip(
+            past_key_values.key_cache, past_key_values.value_cache
+        )):
+            full_bytes += key.numel() * key.element_size()
+            full_bytes += value.numel() * value.element_size()
+            target_layer = self.layer_map[source_layer]
+            target_device = self.get_layer_device(target_layer)
+            routed_key, routed_value, state = slice_segmented_kv(
+                key,
+                value,
+                context_length=context_length,
+                latent_length=latent_length,
+                keep_context=source_layer in context_set,
+                keep_latent=source_layer in latent_set,
+            )
+            # Move only the retained contiguous tensors, unlike the legacy path
+            # which moves the full cache before slicing.
+            routed_key = routed_key.to(target_device)
+            routed_value = routed_value.to(target_device)
+            routed.update(routed_key, routed_value, target_layer)
+            states[target_layer] = state
+            prefix_lengths[target_layer] = int(routed_key.shape[-2])
+            actual_bytes += routed_key.numel() * routed_key.element_size()
+            actual_bytes += routed_value.numel() * routed_value.element_size()
+
+        accounting = logical_retention(
+            self.A_num_layers,
+            self.segmented_context_layers,
+            self.segmented_latent_layers,
+            context_length,
+            latent_length,
+        )
+        routed._segmented_kv = True
+        routed._segmented_context_length = int(context_length)
+        routed._segmented_latent_length = int(latent_length)
+        routed._segmented_logical_prefix_length = int(logical_length)
+        routed._segmented_next_position = int(logical_length)
+        routed._segmented_prefix_lengths = prefix_lengths
+        routed._segmented_states = states
+        routed._segmented_actual_bytes = int(actual_bytes)
+        routed._segmented_accounting = accounting
+        self.last_segmented_stats = {
+            **accounting,
+            "actual_tensor_bytes": int(actual_bytes),
+            "full_tensor_bytes": int(full_bytes),
+            "byte_retention_ratio": actual_bytes / full_bytes if full_bytes else 0.0,
+            "context_length": int(context_length),
+            "latent_length": int(latent_length),
+            "states": dict(states),
+        }
+        return routed
+
     def forward(
         self,
         input_ids: torch.LongTensor,
         attention_mask: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
         out_A_past_key_values: Optional[Cache] = None,
+        logits_to_keep: int | torch.Tensor = 0,
         **kwargs
     ):
 
         if out_A_past_key_values is None:
-            raise NotImplementedError("out_A_past_key_values is required when input_ids.shape[-1] > 1")
+            raise NotImplementedError("out_A_past_key_values is required")
         else:
-            if input_ids.shape[-1] > 1:
+            # Do not infer the prefill/decode phase from input length: a valid
+            # receiver prompt can contain exactly one token. Generation starts
+            # with no B cache (or an empty DynamicCache) and later supplies the
+            # cache returned by this communicator.
+            has_receiver_cache = (
+                past_key_values is not None
+                and past_key_values.get_seq_length() > 0
+            )
+            if not has_receiver_cache:
                 out_A_past_key_values = self.prepare_key_cache(out_A_past_key_values)
             else:
                 out_A_past_key_values = past_key_values
-                assert past_key_values is not None, "past_key_values is required when input_ids.shape[-1] == 1"
         
-        if self.shift_back:
+        if self.segmented_kv:
+            out_B = forward_segmented_qwen3(
+                model=self.B,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=out_A_past_key_values,
+                logits_to_keep=logits_to_keep,
+                **kwargs,
+            )
+        elif self.shift_back:
             if type(self.B.model) == LlamaModel:
                 out_B = forward_shift_back_llama(
                     model=self.B,
                     input_ids=input_ids,
+                    attention_mask=attention_mask,
                     past_key_values=out_A_past_key_values,
+                    logits_to_keep=logits_to_keep,
                     **kwargs
                 )
             elif type(self.B.model) in (Qwen2Model, Qwen3Model):
                 out_B = forward_shift_back_qwen2(
                     model=self.B,
                     input_ids=input_ids,
+                    attention_mask=attention_mask,
                     past_key_values=out_A_past_key_values,
+                    logits_to_keep=logits_to_keep,
                     **kwargs
                 )
             else:
                 raise NotImplementedError(f"shift_back is not implemented for model type {type(self.B)}")
         else:
+            if "logits_to_keep" in inspect.signature(self.B.forward).parameters:
+                kwargs["logits_to_keep"] = logits_to_keep
             out_B = self.B(
                 input_ids=input_ids,
+                attention_mask=attention_mask,
                 past_key_values=out_A_past_key_values,
                 **kwargs
             )
@@ -348,12 +570,111 @@ def get_short_past_key_values(past_key_values: DynamicCache):
 
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
+
+@torch._dynamo.disable
+def forward_segmented_qwen3(
+    model: PreTrainedModel,
+    input_ids: Optional[torch.LongTensor] = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    past_key_values=None,
+    logits_to_keep: int | torch.Tensor = 0,
+    **kwargs,
+):
+    """Qwen3 forward for per-layer segmented cache geometries.
+
+    Each layer can have a different physical prefix length, while B's RoPE
+    positions remain in the original full-cache coordinate frame.  Version 1
+    intentionally supports batch size one only; padding cannot be represented
+    safely by one shared logical position sequence here.
+    """
+    if past_key_values is None or not getattr(past_key_values, "_segmented_kv", False):
+        raise ValueError("forward_segmented_qwen3 requires a segmented DynamicCache")
+    if input_ids is None or input_ids.shape[0] != 1:
+        raise ValueError("Segmented Dual-KV v1 requires batch_size=1")
+
+    inputs_embeds = model.get_input_embeddings()(input_ids)
+    seq_len = inputs_embeds.shape[1]
+    logical_start = int(past_key_values._segmented_next_position)
+    logical_position_ids = torch.arange(
+        logical_start,
+        logical_start + seq_len,
+        device=inputs_embeds.device,
+    ).unsqueeze(0)
+    position_embeddings = model.model.rotary_emb(inputs_embeds, logical_position_ids)
+
+    output_hidden_states = kwargs.get(
+        "output_hidden_states", model.model.config.output_hidden_states
+    )
+    hidden_states = inputs_embeds
+    all_hidden_states = () if output_hidden_states else None
+    for layer_idx, decoder_layer in enumerate(
+        model.model.layers[: model.config.num_hidden_layers]
+    ):
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+        physical_past = int(past_key_values.key_cache[layer_idx].shape[-2])
+        physical_cache_position = torch.arange(
+            physical_past,
+            physical_past + seq_len,
+            device=inputs_embeds.device,
+        )
+        physical_position_ids = physical_cache_position.unsqueeze(0)
+        physical_attention_mask = torch.ones(
+            (1, physical_past + seq_len),
+            dtype=torch.long,
+            device=inputs_embeds.device,
+        )
+        mask_kwargs = {
+            "config": model.model.config,
+            "input_embeds": hidden_states,
+            "attention_mask": physical_attention_mask,
+            "cache_position": physical_cache_position,
+            "past_key_values": past_key_values,
+            # Mask construction uses physical sequence geometry.  RoPE below
+            # deliberately uses logical_position_ids instead.
+            "position_ids": physical_position_ids,
+        }
+        masks = {"full_attention": create_causal_mask(**mask_kwargs)}
+        if getattr(model.model, "has_sliding_layers", False):
+            masks["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+        attention_type = getattr(decoder_layer, "attention_type", "full_attention")
+
+        layer_outputs = decoder_layer(
+            hidden_states,
+            attention_mask=masks[attention_type],
+            position_ids=logical_position_ids,
+            past_key_value=past_key_values,
+            output_attentions=model.model.config.output_attentions,
+            use_cache=model.model.config.use_cache,
+            cache_position=physical_cache_position,
+            position_embeddings=position_embeddings,
+        )
+        hidden_states = layer_outputs[0]
+
+    past_key_values._segmented_next_position = logical_start + seq_len
+    hidden_states = model.model.norm(hidden_states)
+    if output_hidden_states:
+        all_hidden_states += (hidden_states,)
+    slice_indices = (
+        slice(-logits_to_keep, None)
+        if isinstance(logits_to_keep, int)
+        else logits_to_keep
+    )
+    logits = model.lm_head(hidden_states[:, slice_indices, :])
+    return CausalLMOutputWithPast(
+        logits=logits,
+        past_key_values=past_key_values,
+        hidden_states=all_hidden_states,
+        attentions=None,
+    )
+
 @torch._dynamo.disable
 def forward_shift_back_llama(
     model: PreTrainedModel,
     input_ids: Optional[torch.LongTensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
     past_key_values=None,
+    logits_to_keep: int | torch.Tensor = 0,
     **kwargs,
 ):
     inputs_embeds = model.get_input_embeddings()(input_ids)
@@ -415,11 +736,15 @@ def forward_shift_back_llama(
     position_embeddings = model.model.rotary_emb(hidden_states, position_ids)
     short_position_embeddings = model.model.rotary_emb(hidden_states, short_position_ids)
     
-    all_hidden_states = ()
+    output_hidden_states = kwargs.get(
+        "output_hidden_states", model.model.config.output_hidden_states
+    )
+    all_hidden_states = () if output_hidden_states else None
 
     for i, decoder_layer in enumerate(model.model.layers[: model.config.num_hidden_layers]):
 
-        all_hidden_states += (hidden_states,)
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
 
         if past_key_values.key_cache[i].shape[-2] == short_length:
             layer_outputs = decoder_layer(
@@ -448,9 +773,15 @@ def forward_shift_back_llama(
 
     hidden_states = model.model.norm(hidden_states)
 
-    all_hidden_states += (hidden_states,)
+    if output_hidden_states:
+        all_hidden_states += (hidden_states,)
 
-    logits = model.lm_head(hidden_states)
+    slice_indices = (
+        slice(-logits_to_keep, None)
+        if isinstance(logits_to_keep, int)
+        else logits_to_keep
+    )
+    logits = model.lm_head(hidden_states[:, slice_indices, :])
 
     return CausalLMOutputWithPast(
         logits=logits,
@@ -465,6 +796,7 @@ def forward_shift_back_qwen2(
     input_ids: Optional[torch.LongTensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
     past_key_values=None,
+    logits_to_keep: int | torch.Tensor = 0,
     **kwargs,
 ):
     inputs_embeds = model.get_input_embeddings()(input_ids)
@@ -537,11 +869,15 @@ def forward_shift_back_qwen2(
     position_embeddings = model.model.rotary_emb(hidden_states, position_ids)
     short_position_embeddings = model.model.rotary_emb(hidden_states, short_position_ids)
     
-    all_hidden_states = ()
+    output_hidden_states = kwargs.get(
+        "output_hidden_states", model.model.config.output_hidden_states
+    )
+    all_hidden_states = () if output_hidden_states else None
 
     for i, decoder_layer in enumerate(model.model.layers[: model.config.num_hidden_layers]):
 
-        all_hidden_states += (hidden_states,)
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
 
         if past_key_values.key_cache[i].shape[-2] == short_length:
             layer_outputs = decoder_layer(
@@ -570,9 +906,15 @@ def forward_shift_back_qwen2(
 
     hidden_states = model.model.norm(hidden_states)
 
-    all_hidden_states += (hidden_states,)
+    if output_hidden_states:
+        all_hidden_states += (hidden_states,)
 
-    logits = model.lm_head(hidden_states)
+    slice_indices = (
+        slice(-logits_to_keep, None)
+        if isinstance(logits_to_keep, int)
+        else logits_to_keep
+    )
+    logits = model.lm_head(hidden_states[:, slice_indices, :])
 
 
     return CausalLMOutputWithPast(
