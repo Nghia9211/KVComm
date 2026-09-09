@@ -29,11 +29,29 @@ Two modes are compared:
 ## 3. Proposed Directions
 
 ### 3.1 Dual-Selective KV Routing
-Route layers **per token type** instead of pruning uniformly:
-- Original context tokens (T_A): keep shallow-to-mid layers (~0–14) to preserve factual/verbatim information (fixes MultiFieldQA-EN regression).
-- Latent thinking tokens (N): keep mid-to-deep layers (~14–35) where reasoning representations live.
+Route KV **per token segment at each layer** instead of pruning the complete
+cache of a layer uniformly. The implemented v1 first runs five full-KV,
+greedy calibration examples and computes two independent scores:
 
-Target: ~70% reduction in transferred KV size while retaining both retrieval fidelity and reasoning capability.
+- `ContextScore[l]`: mean attention mass from B queries to A's original input
+  tokens at layer `l` (the sink token is excluded from scoring).
+- `LatentScore[l]`: mean attention mass from B queries to A's latent tokens at
+  layer `l`.
+
+Each ranking keeps `floor(0.7 * L)` layers. Their overlap is allowed, producing
+four real per-layer routes: context+latent, context-only, sink+latent, and
+sink-only. The original attention sink is retained at every layer. Cached A
+keys keep their original RoPE; B positions continue from the full logical
+length `T_A + N`, while causal masks use each layer's physical cache length.
+
+This is Mode 5 (`--segmented_kv_select`). Mode 4 (`--dual_kv_select`) remains a
+legacy depth-split baseline: it unions shallow/deep layer lists and transfers
+full context+latent KV at every retained layer. V1 is restricted to batch size
+1 and matching full-attention Qwen3 architectures (such as Qwen3-4B).
+
+The 70% setting is a fixed layer-count budget per segment, not a 70% byte
+reduction. It retains approximately 70% of full KV token positions (plus sink
+overhead); direct byte-budget optimization is future work.
 
 ### 3.2 Adaptive Latent Steps & Early Exit
 Stop the latent loop automatically when the hidden state converges (cosine similarity of h⁽ⁿ⁾ vs. h⁽ⁿ⁻¹⁾ ≈ 1). Expected: ~50% runtime reduction and elimination of the accuracy decay observed at high step counts.
@@ -56,7 +74,7 @@ Automatically detect task type and route:
 - **Metrics**: task accuracy (EM/F1/Rouge-L), wall-clock time, transferred-KV size, garbage-response rate.
 - **Ablations**: random vs. importance-based layer selection, latent step sweep, per-token-type routing splits, α sweep for anchor realignment.
 - **Success criteria**:
-  1. Dual-selective routing matches or beats Mode 1 accuracy on reasoning tasks while recovering plain-KVComm accuracy on MultiFieldQA-EN, at ≤ 50% of Mode 1's transferred KV size.
+  1. Segmented Dual-KV improves the quality/communication Pareto frontier over Mode 2 and legacy Mode 4 at the fixed 70%-per-segment setting. A later byte-budgeted version targets ≤ 50% of Mode 1's transferred KV size.
   2. Early exit reduces latent-variant runtime ≥ 40% with no accuracy loss.
   3. Garbage-response rate < 0.5% on distilled models at any step count.
 ## Reproducibility update: prompt and metric v2

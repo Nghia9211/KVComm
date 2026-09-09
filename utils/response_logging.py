@@ -21,6 +21,8 @@ def build_response_record(
     generated_tokens_a: Optional[int] = None, generated_tokens_b: Optional[int] = None,
     communication_type: str = "latent_kv", latent_steps: Optional[int] = None,
     layer_selection_mode: Optional[str] = None, selected_layers: Optional[list[int]] = None,
+    context_layers: Optional[list[int]] = None, latent_layers: Optional[list[int]] = None,
+    segmented_stats: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     return {
         "schema_version": "v2",
@@ -51,5 +53,8 @@ def build_response_record(
             "steps": latent_steps,
             "layer_selection_mode": layer_selection_mode,
             "selected_layers": selected_layers,
+            "context_layers": context_layers,
+            "latent_layers": latent_layers,
+            "segmented_stats": dict(segmented_stats or {}),
         },
     }

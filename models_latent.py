@@ -263,68 +263,6 @@ class LatentMAS:
         return aligned.to(hidden.dtype)
 
     # ------------------------------------------------------------------
-    # Latent-only truncation
-    # ------------------------------------------------------------------
-
-    def _truncate_to_latent(self, past: DynamicCache) -> DynamicCache:
-        """
-        Return a new DynamicCache containing ONLY the last latent_steps KV entries.
-
-        Discards the T_input prefix tokens and keeps only the N latent thinking
-        tokens. This ensures model_B attends to the compressed latent
-        representation only, not A's full input-token context, preventing
-        latent tokens from being diluted.
-
-        Equivalent to LatentMAS's latent_only=True / _truncate_past() mode.
-
-        Implementation follows LatentMAS._truncate_past():
-          to_legacy_cache() → slice last N tokens per layer → from_legacy_cache()
-        This avoids the _seen_tokens side-effect of DynamicCache.update().
-
-        Positional encoding note (BUG #1 partial fix):
-        The latent keys were originally encoded at positions T_input..T_input+N-1.
-        After truncation we reset _seen_tokens=0 so HuggingFace assigns
-        position_ids 0..N-1 when Model B first uses this cache.
-        This reduces the positional delta from ~T_input+N to just ~N tokens,
-        which is a much smaller RoPE mismatch.
-        For a full fix (zero mismatch), set shift_back=True in CVCommunicator.
-
-        Args:
-            past: DynamicCache with shape per layer [B, kv_heads, T+N, head_dim].
-
-        Returns:
-            DynamicCache with shape per layer [B, kv_heads, N, head_dim].
-            _seen_tokens = 0  (so Model B assigns positions 0..N-1).
-        """
-        N = self.latent_steps
-
-        # ── Use to_legacy_cache / from_legacy_cache (LatentMAS _truncate_past pattern)
-        # Avoids _seen_tokens side-effect of calling update() in a loop.
-        legacy = past.to_legacy_cache()  # tuple of (k, v) per layer
-        trimmed_legacy = tuple(
-            (
-                layer_kv[0][:, :, -N:, :].contiguous(),  # key:   keep last N
-                layer_kv[1][:, :, -N:, :].contiguous(),  # value: keep last N
-            )
-            for layer_kv in legacy
-        )
-        new_cache = DynamicCache.from_legacy_cache(trimmed_legacy)
-
-        # ── BUG #1 fix: reset _seen_tokens so Model B starts from position 0
-        # Without this, HuggingFace would assign position_ids starting at N
-        # (e.g. 20), making B's queries attend to latent keys at positions 0..N-1
-        # with a delta of only N — much better than the T_input+N delta before.
-        new_cache._seen_tokens = 0
-
-        orig_len = past.key_cache[0].shape[-2] if past.key_cache else N
-        logging.debug(
-            f"_truncate_to_latent: kept last {N} tokens "
-            f"(discarded {orig_len - N} input tokens), "
-            f"_seen_tokens reset to 0 (was {N})"
-        )
-        return new_cache
-
-    # ------------------------------------------------------------------
     # Main latent thinking loop
     # Ported from: LatentMAS/models.py ModelWrapper.generate_latent_batch()
     # ------------------------------------------------------------------
@@ -334,7 +272,6 @@ class LatentMAS:
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        latent_only: bool = False,
     ) -> DynamicCache:
         """
         Run latent thinking on the given input and return a DynamicCache.
@@ -346,21 +283,17 @@ class LatentMAS:
             cv.generate(input_ids_B, out_A_past_key_values=latent_past_kv, ...)
 
         Mode 1 (latent_kv_select=False): cv has all layers -> full cache passes through.
-        Mode 2 (latent_kv_select=True):  cv.prepare_key_cache() selects layers.
+        Mode 2 (latent_kv_select=True): cv.prepare_key_cache() selects layers.
+        Mode 5 (segmented_kv_select=True): the communicator independently
+        selects the pre-latent input and latent-token segments per layer.
 
         Args:
             input_ids:    [B, T] token ids.
             attention_mask: [B, T] mask (default: all ones). Handles right-padded batches.
-            latent_only:  If True, truncate the returned cache to only the last
-                          latent_steps tokens (pure latent thinking tokens).
-                          Prevents latent tokens from being diluted by T_input tokens
-                          when model_B attends to A's KV cache.
-                          If False (default), return full T + latent_steps cache.
-
         Returns:
-            DynamicCache:
-              latent_only=False → shape per layer [B, kv_heads, T + latent_steps, head_dim]
-              latent_only=True  → shape per layer [B, kv_heads, latent_steps, head_dim]
+            Full DynamicCache with shape per layer
+            ``[B, kv_heads, T_input + latent_steps, head_dim]``.  Segment
+            selection, when requested, happens later in CVCommunicator.
         """
         if input_ids.dim() != 2:
             raise ValueError(
@@ -466,12 +399,10 @@ class LatentMAS:
                 f"past_len={past.get_seq_length()}"
             )
 
-        # Optionally truncate to only the latent thinking tokens
-        if latent_only and self.latent_steps > 0:
-            past = self._truncate_to_latent(past)
-            # past.key_cache[i].shape = [B, kv_heads, latent_steps, head_dim]
-        else:
-            # past.key_cache[i].shape = [B, kv_heads, T_input + latent_steps, head_dim]
-            pass
+        # Preserve the semantic boundary for Segmented Dual-KV.  These are
+        # ordinary Python attributes on DynamicCache and do not alter tensors.
+        past._kvcomm_context_length = int(input_ids.shape[-1])
+        past._kvcomm_latent_length = int(self.latent_steps)
+        past._kvcomm_logical_length = int(input_ids.shape[-1] + self.latent_steps)
 
         return past

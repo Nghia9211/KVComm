@@ -29,11 +29,29 @@ Hai chế độ được so sánh:
 ## 3. Các Hướng Đề xuất
 
 ### 3.1 Định tuyến KV Chọn lọc Kép (Dual-Selective KV Routing)
-Định tuyến các lớp **theo từng loại token** thay vì tỉa bớt đồng nhất:
-- Token ngữ cảnh ban đầu (T_A): giữ các lớp từ nông đến trung bình (~0–14) để bảo toàn thông tin thực tế/nguyên văn (sửa sự suy giảm trên MultiFieldQA-EN).
-- Token suy nghĩ ẩn (N): giữ các lớp từ trung bình đến sâu (~14–35) nơi chứa các biểu diễn suy luận.
+Định tuyến KV **theo từng đoạn token tại mỗi layer**, thay vì cắt toàn bộ cache
+của một layer. Bản v1 đã implement chạy 5 mẫu calibration với full KV và greedy,
+sau đó tính hai điểm độc lập:
 
-Mục tiêu: Giảm ~70% kích thước KV truyền đi trong khi vẫn giữ nguyên cả độ trung thực truy xuất lẫn khả năng suy luận.
+- `ContextScore[l]`: attention mass trung bình từ query của B tới các token input
+  ban đầu của A tại layer `l` (không tính attention-sink).
+- `LatentScore[l]`: attention mass trung bình từ query của B tới các latent token
+  của A tại layer `l`.
+
+Mỗi bảng xếp hạng giữ `floor(0.7 * L)` layer và cho phép hai tập chồng nhau. Vì
+vậy mỗi layer có đúng một trong bốn trạng thái thật: context+latent,
+context-only, sink+latent, hoặc sink-only. Attention-sink gốc luôn được giữ.
+Key đã cache của A giữ nguyên RoPE; vị trí của B tiếp tục từ độ dài logic đầy đủ
+`T_A + N`, còn causal mask dùng độ dài cache vật lý riêng của từng layer.
+
+Đây là Mode 5 (`--segmented_kv_select`). Mode 4 (`--dual_kv_select`) được giữ làm
+baseline cũ: nó hợp hai danh sách layer nông/sâu rồi truyền full context+latent KV
+ở mọi layer được giữ. V1 chỉ hỗ trợ batch size 1 và A/B có cùng kiến trúc Qwen3
+full-attention (ví dụ Qwen3-4B).
+
+Mốc 70% là budget số layer cho từng segment, không phải giảm 70% số byte. Nó giữ
+xấp xỉ 70% số vị trí KV của full cache (cộng overhead của sink); tối ưu trực tiếp
+theo byte budget được để lại cho hướng phát triển tiếp theo.
 
 ### 3.2 Bước Tư duy Ẩn Thích ứng & Dừng Sớm (Adaptive Latent Steps & Early Exit)
 Tự động dừng vòng lặp ẩn khi trạng thái ẩn hội tụ (độ tương đồng cosine của h⁽ⁿ⁾ so với h⁽ⁿ⁻¹⁾ ≈ 1). Kỳ vọng: Giảm ~50% thời gian thực thi và loại bỏ sự suy giảm độ chính xác quan sát được ở số bước cao.
@@ -56,6 +74,6 @@ Tự động phát hiện loại nhiệm vụ và định tuyến:
 - **Thước đo (Metrics)**: độ chính xác nhiệm vụ (EM/F1/Rouge-L), thời gian thực thi thực tế, kích thước KV truyền đi, tỷ lệ phản hồi rác.
 - **Thử nghiệm cắt giảm (Ablations)**: chọn lớp ngẫu nhiên so với chọn lớp theo độ quan trọng, thử nghiệm quét số bước ẩn, phân chia định tuyến theo từng loại token, quét tham số α cho căn chỉnh điểm neo.
 - **Tiêu chí thành công**:
-  1. Định tuyến chọn lọc kép đạt hoặc vượt độ chính xác của Mode 1 trên các nhiệm vụ suy luận, đồng thời phục hồi độ chính xác của KVComm thuần trên MultiFieldQA-EN, với dung lượng KV truyền đi ≤ 50% so với Mode 1.
+  1. Segmented Dual-KV cải thiện biên Pareto chất lượng/chi phí so với Mode 2 và Mode 4 cũ ở cấu hình cố định 70% mỗi segment. Phiên bản byte-budget sau đó hướng tới dung lượng KV truyền đi ≤ 50% Mode 1.
   2. Cơ chế dừng sớm giảm thời gian chạy của biến thể ẩn ≥ 40% mà không làm giảm độ chính xác.
   3. Tỷ lệ phản hồi rác < 0.5% trên các mô hình chắt lọc ở bất kỳ số bước nào.

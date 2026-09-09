@@ -112,6 +112,10 @@ A claim that Mode 1 prefill is catastrophically misaligned (`cache_position` sta
 4. Fix the latent-loop padding mask before any batched experiments (B3).
 5. Delete or rewrite the `latent_only` / `_seen_tokens` path (N1, N3) — broken *and* silently ignored, which invalidates it as an ablation.
 
+**Implementation status (2026-09-09):** the global `latent_only` path and CLI
+flag have been removed. Mode 5 performs explicit per-layer context/latent
+segment routing while retaining the original sink and logical RoPE positions.
+
 **Implication for the problem statements above**: P2 (latent drift) is partly *measurement artifact* — B1/B2 inflate the apparent drift; the true intrinsic decay curve is unknown until they are fixed. P5 (RoPE mismatch) is worse than documented: both claimed mitigations (N1, N2) are ineffective, and F4's Mode 1 > Mode 2 gap may be partly explained by B4 rather than by information loss from layer pruning.
 ## Protocol-version note
 
