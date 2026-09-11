@@ -8,19 +8,32 @@ import requests
 import os
 import regex
 from datetime import datetime
-import regex, contractions, string, unicodedata
+import unicodedata
 import tqdm as tqdm
 import nltk
 from nltk.stem import WordNetLemmatizer
 from nltk.corpus import wordnet
 from nltk.tokenize import word_tokenize
 
-nltk.download('averaged_perceptron_tagger', quiet=True)
-nltk.download('punkt', quiet=True)
-nltk.download('wordnet', quiet=True)
-nltk.download('omw-1.4', quiet=True)
-nltk.download('punkt_tab', quiet=True)
-nltk.download('averaged_perceptron_tagger_eng', quiet=True)
+def ensure_nltk_resources():
+    """Lazily provision the same resources required by the legacy metric."""
+    resources = (
+        ("taggers/averaged_perceptron_tagger", "averaged_perceptron_tagger"),
+        ("tokenizers/punkt", "punkt"),
+        ("corpora/wordnet", "wordnet"),
+        ("corpora/omw-1.4", "omw-1.4"),
+        ("tokenizers/punkt_tab", "punkt_tab"),
+        ("taggers/averaged_perceptron_tagger_eng", "averaged_perceptron_tagger_eng"),
+    )
+    for path, package in resources:
+        try:
+            nltk.data.find(path)
+        except LookupError:
+            try:
+                nltk.data.find(path + ".zip")
+            except LookupError:
+                nltk.download(package, quiet=True)
+
 
 lemmatizer = WordNetLemmatizer()
 
@@ -185,6 +198,7 @@ def normalize_answer(text, lower=True):
         return preprocess(fix_answer(' '.join(text.split())))
 
 def lemmatize_text(text):
+    ensure_nltk_resources()
     # Initialize lemmatizer
 
     # Helper function to get POS tag for better lemmatization

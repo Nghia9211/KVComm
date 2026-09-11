@@ -1,5 +1,11 @@
 # Adaptive Latent Steps v1 — kiểm thử và chạy thí nghiệm
 
+> Cleanup: Mode 4/5 và `--track_convergence` đã được gỡ. Dùng `--latent_trace`.
+> `--mode all` chỉ gồm m3/textmas/m1/m2. Kết quả lịch sử và policy JSON giữ nguyên;
+> code hash mới yêu cầu output profiling mới, không resume vào JSONL trước cleanup.
+> Script sweep dùng Python đang active hoặc `--python PATH`, không hard-code server.
+
+
 V1 là **controller không training**, frozen A/B; không có adapter học, LoRA,
 receiver probe online hay gold answer trong quyết định dừng. Hỗ trợ Qwen3 → cùng
 Qwen3, Mode 1/2, batch_size=1. Mặc định `fixed` giữ hành vi cũ.
@@ -205,10 +211,38 @@ thay đổi này. Hai rủi ro OOM cũ vẫn có thể xảy ra trước khi sto
 Qwen3-4B sẽ vừa 4×3080 cho mọi context. Cần chạy smoke GPU và calibration thật
 trước khi kết luận controller tăng chất lượng trong cùng thời gian.
 
-## 8. Kết quả kiểm tra local (2026-09-11)
+## 8. Kết quả kiểm tra local trước cleanup (2026-09-11)
 
 - 55/55 unittest pass bằng `..\venv\Scripts\python.exe -m unittest discover -s tests -v`.
 - `compileall` và `git diff --check` pass.
 - Git Bash syntax check và dry-run 12 tổ hợp (2 task × 2 mode × 3 N) pass;
-  explicit layers được forward cùng `--top_layers 0`, trace/convergence đến m1/m2.
+  explicit layers được forward cùng `--top_layers 0`, trace đến m1/m2; convergence flag cũ đã được gỡ trong cleanup sau đó.
 - Chưa chạy test CUDA/multi-GPU, Qwen3-4B hoặc benchmark dataset thật.
+
+## 9. Kiểm tra sau cleanup A+B+C+G+H (2026-09-11)
+
+- 53/53 unittest pass (4.479s), gồm inference với Qwen3 nhỏ trên CPU,
+  fixed/adaptive, full/selected KV, shift-back và attention sink.
+- `compileall`, `git diff --check` và `bash -n sweep_latent.sh` pass.
+- 21 cấu hình dry-run pass: 16 cấu hình `all` trên hai task với N=0/10/25,
+  4 cấu hình adaptive full/selected trên hai task và 1 cấu hình Mode 2 auto.
+- Mode 2 manual truyền `--top_layers 0`; auto giữ tỷ lệ đã cấu hình.
+  Interpreter lấy từ `--python` hoặc PATH, không còn đường dẫn server cố định.
+- `m4`, `m5` và `--track_convergence` bị từ chối rõ ràng; test Python cũng kiểm tra
+  các flag đã bỏ bị từ chối trước khi load model.
+- Các entry point `com.py`, `com_ms.py`, `com_online.py`, AC và Cipher vẫn import được.
+- Giữ nguyên `EXPERIMENT_RESULTS.md`, proposal/research và snapshots.
+- Dry-run chỉ kiểm tra tạo lệnh, không chạy benchmark GPU. Chưa xác nhận CUDA,
+  multi-GPU hay chất lượng trên toàn bộ HotpotQA sau cleanup.
+
+Chạy lại tests từ thư mục `KVComm` trên Windows:
+
+```powershell
+..\venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+Dry-run bằng Bash/Git Bash:
+
+```bash
+bash sweep_latent.sh --tasks 'hotpotqa tmath' --mode all --steps '0 10 25' --layers_list '0 3 7' --latent_trace --dry_run
+```

@@ -78,11 +78,9 @@ class TinyQwenTests(unittest.TestCase):
                 reference = reference_fixed(latent, self.ids, steps)
                 self.assert_cache_equal(fixed, reference)
                 latent.latent_trace = True
-                latent.track_convergence = True
                 traced = latent.run(self.ids)
                 self.assert_cache_equal(fixed, traced)
                 self.assertEqual(len(latent.last_run_stats["feature_trace"]), steps)
-                self.assertEqual(len(latent.convergence_history), steps)
                 self.assertEqual(traced._kvcomm_latent_length, steps)
 
     def test_forced_stop_no_extra_forwards_and_reset(self):
@@ -183,8 +181,7 @@ class TinyQwenTests(unittest.TestCase):
             self.assertTrue(torch.equal(first, torch.rand(4)))
 
     def test_evaluator_writes_real_lengths_and_raw_B_tokens(self):
-        # Legacy eval imports attempt NLTK downloads. This test uses no NLTK
-        # metrics and blocks those side effects; production imports are unchanged.
+        # This test uses no NLTK metrics; guard against accidental downloads.
         with patch("nltk.download", return_value=True):
             from eval_latent import LatentCommunicationEvaluator
         class Dataset:
@@ -217,11 +214,14 @@ class TinyQwenTests(unittest.TestCase):
             runner = LatentCommunicationEvaluator(Dataset(), Tokenizer(), False, 200, latent, cv,
                 allow_b_think=True, response_log_path=str(path))
             runner.generate_args["eos_token_id"] = None
-            runner.prepare_input_ids = lambda *args: (self.ids, self.ids[:, :3])
+            from unittest.mock import Mock
+            runner.prepare_input_ids = Mock(side_effect=lambda *args: (self.ids, self.ids[:, :3]))
             packed = [torch.tensor([d, 0., -1., 1.]) for d in (.2, 0., .2, .2, 0.)]
             with patch("models_latent.feature_tensor", side_effect=packed):
                 runner.test(self.a, cv, batch_size=1)
             rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(runner.prepare_input_ids.call_count, 2)
+            self.assertNotIn("segmented_stats", rows[0]["latent"])
             self.assertEqual([row["latent"]["steps"] for row in rows], [2, 3])
             self.assertEqual([row["adaptive"]["actual_cache_length_before_B"] for row in rows], [7, 8])
             self.assertTrue(all(row["token_counts"]["generated_tokens_B"] == 3 for row in rows))

@@ -105,14 +105,11 @@ def main():
     features = PolicyConfig(0.0, value_window=args.value_window, value_layers=tuple(args.value_layers))
     evaluator = get_evaluator(args.task)
     evaluator.data = items
-    tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    from utils.model_loading import load_tokenizer, load_causal_model
+    tokenizer = load_tokenizer(args.model, revision=args.revision)
     init_start = time.perf_counter()
     def load_model(device):
-        model = AutoModelForCausalLM.from_pretrained(args.model, revision=args.revision,
-            device_map="auto" if device == "auto" else {"": device},
-            torch_dtype=torch.bfloat16, attn_implementation="sdpa").eval()
+        model = load_causal_model(args.model, device, revision=args.revision).eval()
         model.name = args.model
         return model
     a, b = load_model(args.device), load_model(args.device_B)

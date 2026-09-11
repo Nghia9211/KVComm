@@ -257,37 +257,24 @@ python com_latent.py \
     --shift_back
 ```
 
-#### Mode 4 — Legacy Dual-KV depth split
+#### Retired experiments
 
-Mode 4 is retained for comparison with earlier experiments. It chooses shallow
-and deep layer groups, unions them, and transfers the full context+latent cache
-at each retained layer. It does not route the two token segments separately.
+Mode 4 (legacy Dual-KV), Mode 5 (Segmented Dual-KV), and
+`--track_convergence` are removed from the active runtime.
+Use `--latent_trace` for diagnostic features. Historical results remain in
+[EXPERIMENT_RESULTS.md](EXPERIMENT_RESULTS.md); old proposals are research history,
+not supported launch instructions.
 
-#### Mode 5 — Segmented Dual-KV
+#### Adaptive Latent Steps
 
-```bash
-python com_latent.py \
-    --model_A Qwen/Qwen3-4B \
-    --model_B Qwen/Qwen3-4B \
-    --test_task hotpotqa \
-    --do_test_latent \
-    --segmented_kv_select \
-    --latent_steps 10 \
-    --context_top_ratio 0.7 \
-    --latent_top_ratio 0.7 \
-    --calib_size 5 \
-    --batch_size 1 \
-    --shift_back
-```
+Mode 1/2 support `--latent_step_policy fixed|cosine|hidden_value`.
+See [the testing and evaluation guide](tests/ADAPTIVE_LATENT_TESTING.md).
+Adaptive Mode 2 requires a frozen explicit layer list.
+`sweep_latent.sh --mode all` now runs m3, textmas, m1, m2 only.
+The sweep uses `--python PATH` when supplied, otherwise the active PATH's Python;
+there is no hard-coded server environment.
 
-Mode 5 independently ranks context and latent attention mass, keeps
-`floor(ratio × number_of_layers)` layers for each segment, and preserves the
-original attention sink everywhere. V1 requires matching full-attention Qwen3
-architectures and `batch_size=1`.
-
-
-
-### Runinng Thinking Model :
+### Running a Thinking Model### Runinng Thinking Model :
 ```bash
 python com_latent.py --model_A suayptalha/DeepSeek-R1-Distill-Llama-3B --model_B suayptalha/DeepSeek-R1-Distill-Llama-3B --latent_steps 1 --do_test_latent --test_task tmath --device cuda:0 --device_B cuda:1    
 ```
@@ -302,13 +289,9 @@ python com_latent.py --model_A suayptalha/DeepSeek-R1-Distill-Llama-3B --model_B
 | `--latent_steps` | int | `5` | Number of latent thinking iterations. Lower = less degeneration (recommended: 5–10) |
 | `--no_latent_space_realign` | flag | disabled | Disable the default realignment matrix W between latent steps |
 | `--latent_kv_select` | flag | `False` | Enable Mode 2: filter KV cache by layer importance before passing to B |
-| `--dual_kv_select` | flag | `False` | Enable legacy Mode 4 depth-split layer selection |
-| `--segmented_kv_select` | flag | `False` | Enable Mode 5 independent context/latent segment routing |
 | `--calib_size` | int | `5` | Number of calibration samples for layer ranking |
 | `--shift_back` | flag | `False` | Fix RoPE position mismatch for attention-sink-only layers. **Always enable with latent** |
 | `--top_layers` | float | `0.0` | Fraction of top-importance layers to keep (e.g., `0.7` = keep top 70%) |
-| `--context_top_ratio` | float | `0.7` | Mode 5 fraction of layers retaining context KV |
-| `--latent_top_ratio` | float | `0.7` | Mode 5 fraction of layers retaining latent KV |
 | `--layers_list` | int[] | `[-1]` | Manual layer list for MANUAL sub-mode |
 | `--random_selection` | flag | `False` | Random layer selection (ablation baseline) |
 
@@ -329,9 +312,6 @@ Evaluated on `Qwen/Qwen3-4B → Qwen/Qwen3-4B`, `seed=42`, `temperature=0.6`, `t
 | **Mode 2 (KV Top 70%)** | `--do_test_latent --latent_kv_select` | 20 | ✅ | 0.6827 | 1014s |
 | **Mode 2 (KV Top 70%)** | `--do_test_latent --latent_kv_select` | 40 | ✅ | 0.6897 | 1804s |
 | **Mode 2 (KV Top 70%)** | `--do_test_latent --latent_kv_select` | 80 | ✅ | **0.6928** | 3071s |
-| Mode 4 (Dual KV Legacy) | `--do_test_latent --dual_kv_select` | 10 | ✅ (whole layer) | 0.3814 | 874s |
-| **Mode 5 (Segmented Dual-KV, Top 70%)** | `--do_test_latent --segmented_kv_select` | 10 | ✅ (per segment) | 0.5707 | 1343s |
-| **Mode 5 (Segmented Dual-KV, Full 100%)** | `--do_test_latent --segmented_kv_select` | 10 | ❌ (all layers) | 0.6739 | 1225s |
 
 #### TMATH (300 samples, `legacy_match`, prompt v1)
 
@@ -340,7 +320,6 @@ Evaluated on `Qwen/Qwen3-4B → Qwen/Qwen3-4B`, `seed=42`, `temperature=0.6`, `t
 | TextMAS | `--do_test_nld` | — | ❌ | 0.3710 | 21561s |
 | **Mode 1 (Full KV)** | `--do_test_latent` | 10 | ❌ | **0.3864** | 11268s |
 | Mode 2 (KV Top 70%) | `--do_test_latent --latent_kv_select` | 10 | ✅ | 0.3782 | 10533s |
-| Mode 4 (Dual KV Legacy) | `--do_test_latent --dual_kv_select` | 10 | ✅ (whole layer) | 0.3751 | 11777s |
 
 #### MedQA (300 samples, Accuracy, prompt v1)
 
@@ -349,7 +328,6 @@ Evaluated on `Qwen/Qwen3-4B → Qwen/Qwen3-4B`, `seed=42`, `temperature=0.6`, `t
 | TextMAS | `--do_test_nld` | — | ❌ | 0.6767 | 46347s |
 | Mode 1 (Full KV) | `--do_test_latent` | 10 | ❌ | 0.6667 | 26823s |
 | **Mode 2 (KV Top 70%)** | `--do_test_latent --latent_kv_select` | 10 | ✅ | **0.6867** | 24028s |
-| Mode 4 (Dual KV Legacy) | `--do_test_latent --dual_kv_select` | 10 | ✅ (whole layer) | 0.6600 | 35074s |
 
 #### MultiFieldQA-EN (150 samples, `longbench_qa_f1`, prompt v2)
 
@@ -373,7 +351,6 @@ snapshots/
 └── llama3.23binstruct-to-llama3.23binstruct_top0.7_lat5_realign_kvsel_MMDD_HHMM/
     ├── log.log                       # Run config and final score
     ├── manifest.json                 # Reproducibility metadata and aggregate stats
-    ├── segmented_calibration.json    # Mode-5 scores and selected layer sets
     └── latent_responses.jsonl        # Per-sample output and routing statistics
 ```
 
@@ -382,16 +359,14 @@ snapshots/
 {
   "schema_version": "v2",
   "idx": 42,
-  "method": "latentmas_segmented_dual_kv",
+  "method": "latentmas_selective_kv",
   "response": "...",
   "answers": ["..."],
-  "item_metrics": {"longbench_qa_f1": 0.75},
+  "item_metrics": {"longbench_f1": 0.75},
   "latent": {
     "steps": 10,
-    "layer_selection_mode": "segmented",
-    "context_layers": [0, 1],
-    "latent_layers": [1, 2],
-    "segmented_stats": {"byte_retention_ratio": 0.70}
+    "layer_selection_mode": "selected",
+    "selected_layers": [0, 1]
   }
 }
 ```
@@ -405,7 +380,7 @@ result = mean over all samples of token_overlap_f1(answer, response)
 ```
 
 Each sample contributes a fractional score from 0 to 1. The old thresholded
-score remains available as `legacy_accuracy`, but it is not the primary metric.
+score remains available as `legacy_match`, but it is not the primary metric.
 ## Evaluation protocol v2 (two-agent adaptation)
 
 New runs use explicit evaluator metadata instead of task-flag fallbacks. This is

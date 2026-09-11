@@ -120,13 +120,12 @@ class PolicyTests(unittest.TestCase):
             path.write_text(json.dumps({"features": {"cosine_distance": .01}}), encoding="utf-8")
             values = dict(latent_policy_config=str(path), latent_step_policy="cosine", latent_steps=80,
                           min_latent_steps=10, latent_check_interval=5, latent_patience=2,
-                          do_test_latent=True, dual_kv_select=False, segmented_kv_select=False,
+                          do_test_latent=True,
                           model_A="Qwen/Qwen3-4B", model_B="Qwen/Qwen3-4B", do_layer_curve=False,
                           random_selection=False, top_layers=0, latent_kv_select=True, layers_list=[1, 2],
                           shift_back=True, batch_size=1, per_sample_seed=False, profile_timing=False)
             validate_runtime(SimpleNamespace(**values))
-            for override in (dict(batch_size=2), dict(top_layers=.7), dict(dual_kv_select=True),
-                             dict(segmented_kv_select=True), dict(shift_back=False), dict(layers_list=[-1]),
+            for override in (dict(batch_size=2), dict(top_layers=.7), dict(do_test_latent=False), dict(shift_back=False), dict(layers_list=[-1]),
                              dict(model_B="other"), dict(latent_policy_config="")):
                 with self.subTest(override=override), self.assertRaises(ValueError):
                     validate_runtime(SimpleNamespace(**dict(values, **override)))

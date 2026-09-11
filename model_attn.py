@@ -14,7 +14,6 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention, apply_rotary_pos_emb as apply_rotary_pos_emb_qwen3, eager_attention_forward as eager_attention_forward_qwen3
 from transformers.models.gemma3.modeling_gemma3 import Gemma3Attention, apply_rotary_pos_emb as apply_rotary_pos_emb_gemma3, eager_attention_forward as eager_attention_forward_gemma3
 from transformers.models.gemma3.configuration_gemma3 import Gemma3TextConfig
-from segmented_kv import segment_attention_mass_from_qk
 
 
 class LlamaAttentionTracer(LlamaAttention):
@@ -130,8 +129,6 @@ class Qwen3AttentionTracer(Qwen3Attention):
     def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__(config, layer_idx)
         self.attn_inputs = None
-        self.segment_boundaries = None
-        self.segment_masses = None
 
     def forward(
         self,
@@ -173,18 +170,7 @@ class Qwen3AttentionTracer(Qwen3Attention):
             "scaling": self.scaling,
             **kwargs,
         }
-        if self.segment_boundaries is not None and self.segment_masses is None:
-            context_length, latent_length = self.segment_boundaries
-            self.segment_masses = segment_attention_mass_from_qk(
-                query_states,
-                key_states,
-                attention_mask,
-                scaling=self.scaling,
-                context_length=context_length,
-                latent_length=latent_length,
-                num_key_value_groups=self.num_key_value_groups,
-            )
-        elif hidden_states.shape[-2] > 1:
+        if hidden_states.shape[-2] > 1:
             self.attn_inputs = attn_inputs
 
         attn_output, attn_weights = attention_interface(

@@ -1,3 +1,4 @@
+from utils.model_loading import load_tokenizer, load_causal_model
 import os
 import torch
 import argparse
@@ -113,20 +114,13 @@ def main(cfg: AlignConfig):
         )
 
     # load tokenizer and model
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model_B)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = load_tokenizer(cfg.model_B)
 
     device_A = cfg.device
     device_B = cfg.device_B if cfg.device_B else cfg.device
 
-    def parse_device_map(d_str: str):
-        if d_str.lower() == "auto":
-            return "auto"
-        return {"": d_str}
-
-    model_A = AutoModelForCausalLM.from_pretrained(cfg.model_A, device_map=parse_device_map(device_A), torch_dtype=torch.bfloat16, attn_implementation="sdpa")
-    model_B = AutoModelForCausalLM.from_pretrained(cfg.model_B, device_map=parse_device_map(device_B), torch_dtype=torch.bfloat16, attn_implementation="sdpa")
+    model_A = load_causal_model(cfg.model_A, device_A)
+    model_B = load_causal_model(cfg.model_B, device_B)
     model_A.eval()
     model_B.eval()
 

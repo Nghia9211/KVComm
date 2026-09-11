@@ -1,61 +1,23 @@
-"""
-eval_latent.py — Latent evaluator for KVComm + LatentMAS integration
+"""Two-agent latent and text evaluation.
 
-Extends CommunicationEvaluator with the following changes vs KVComm original:
-
-  1. prepare_input_ids() [OVERRIDE]:
-       - Sender A: uses latent-thinker prompts from prompts_latent.py
-                   tokenised with add_generation_prompt=True (preserves <think>
-                   for think models)
-       - Receiver B: prepends LATENT_RECEIVER_PREFIX so B knows it has
-                     latent context
-
-  2. inference() [OVERRIDE]:
-       - Replaces model(input_ids_A) with latent_mas.run(input_ids_A)
-       - Always produces the full T+N sender cache. Segmented Dual-KV performs
-         any context/latent reduction later, per layer, in CVCommunicator.
-       - max_new_tokens is sourced from evaluator.max_tokens, which is set
-         per-evaluator class:
-           MedQAEvaluator    →  512
-           MBPPPlusEvaluator → 2048
-           AIME2024Evaluator → 4096
-         So no CLI flag is needed to set max_tokens per task.
-
-  3. Supported LatentMAS tasks (via dataloader flags):
-       # MCQ tasks
-       evaluator.medqa        → MedQAEvaluator      (MCQ medical, \\boxed{A/B/C/D})
-       evaluator.arc_easy     → ARCEasyEvaluator     (MCQ science easy, \\boxed{A/B/C/D})
-       evaluator.arc_challenge→ ARCChallengeEvaluator(MCQ science hard, \\boxed{A/B/C/D})
-       evaluator.gpqa         → GPQAEvaluator        (MCQ graduate sci, \\boxed{A/B/C/D})
-       # Math tasks
-       evaluator.aime         → AIME2024/2025Evaluator (competition math, \\boxed{N})
-       evaluator.gsm8k        → GSM8KEvaluator        (math word problem, \\boxed{N})
-       # Code tasks
-       evaluator.mbppplus     → MBPPPlusEvaluator    (code gen, ```python...```, execute)
-       evaluator.humanevalplus→ HumanEvalPlusEvaluator(code gen, ```python...```, execute)
-
-Layer importance tracking, _test, test are inherited from parent unchanged.
-
-  4. TextMASEvaluator (TextMAS baseline):
-       Natural-language baseline for LatentMAS — sender A generates a short
-       text summary, receiver B reads it and produces the final answer.
-       Uses the same LatentMAS-task prompts as LatentCommunicationEvaluator
-       for a fair comparison. Inherits from NLDEvaluator (eval.py).
+LatentCommunicationEvaluator implements prompt preparation, fixed/adaptive
+sender inference, selected/full KV handoff, metrics and per-sample response logs.
+TextMASEvaluator is an independent A-summary -> B-answer evaluator; it does not
+inherit NLDEvaluator. Both use the shared task-profile prompt/metric utilities.
 """
 
 import json
 import time
 import logging
 import torch
-from collections import defaultdict
 from tqdm import tqdm
 from eval import CommunicationEvaluator, apply_chat_template, is_think_model
 from layer_importance import calc_layer_importance
-from segmented_kv import accumulate_segment_masses
 from models_latent import LatentMAS
 from models import CVCommunicator
 from prompts_latent import build_latent_sender_msg, build_latent_receiver_msg, build_text_receiver_msg
 from utils.response_logging import build_response_record
+from utils.method_names import latent_method
 from utils.evaluation_config import resolve_textmas_budgets
 from adaptive_latent import sample_id, sample_rng, decoding_seed, synchronize_models, cache_payload, content_hash
 
@@ -64,16 +26,15 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
     """
     CommunicationEvaluator extended with LatentMAS thinking for sender A.
 
-    Overrides prepare_input_ids(), inference(), and get_response().
-    All other KVComm evaluation infrastructure (_test, test, layer importance,
-    truncate_input) is inherited without modification.
+    Overrides prompt preparation, inference, response decoding and evaluation.
+    Uses the shared truncation and layer-importance infrastructure.
 
     Operating modes (controlled by CVCommunicator layers_list):
       Mode 1: cv.layers_list = all layers  -> no layer selection
       Mode 2: cv.layers_list = subset      -> KVComm layer selection applied
 
-    Segmented Dual-KV keeps independent context/latent layer sets inside
-    CVCommunicator; LatentMAS itself always returns the full input+latent cache.
+    LatentMAS returns the full input+actual-latent cache. Mode 2 selects whole
+    layers afterwards and preserves the original attention sink.
     """
 
     def __init__(
@@ -119,14 +80,8 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
 
         self.latent_mas = latent_mas
         self.allow_b_think = allow_b_think
-        self.segmented_importance_total = {
-            "context": defaultdict(list),
-            "latent": defaultdict(list),
-        }
         self.last_context_length = None
         self.last_latent_length = None
-        self.last_segmented_stats = None
-        self.segmented_stats_history = []
         self.name = "latent_communication"
 
         # ── Max output tokens for B (LatentMAS-only override) ──────────────
@@ -153,7 +108,6 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
             f"latent_steps={latent_mas.latent_steps}, "
             f"latent_space_realign={latent_mas.latent_space_realign}, "
             f"layers_list={cv.layers_list}, "
-            f"segmented={cv.segmented_kv}, "
             f"allow_b_think={allow_b_think}, "
             f"max_new_tokens={effective_max_tokens} "
             f"({'override' if max_tokens_B > 0 else 'from evaluator'}), "
@@ -282,7 +236,7 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
         Changes vs CommunicationEvaluator.inference():
           1. prepare_input_ids() now uses latent-aware prompts (overridden above).
           2. Sender uses latent_mas.run() instead of model(input_ids_A).
-          3. CVCommunicator optionally applies per-segment routing.
+          3. CVCommunicator optionally selects whole KV layers.
 
         Args:
             model: model_A (passed by _test(), kept for API compatibility).
@@ -311,9 +265,6 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
         )
         self.last_context_length = int(input_ids_A.shape[-1])
         self.last_latent_length = int(latent_past_kv._kvcomm_latent_length)
-        cv.configure_segmented_attention_capture(
-            self.last_context_length, self.last_latent_length
-        )
 
         # ── FIX: prepend past_mask cho attention_mask của B ───────────────
         # LatentMAS gốc (models.py L244-252) luôn prepend một mask có shape
@@ -339,7 +290,7 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
         # cv.generate() → prepare_key_cache(latent_past_kv)
         #               → layer selection (Mode 2) or identity (Mode 1)
         #               → model_B.generate với attention_mask_B đúng
-        payload = {} if cv.segmented_kv else cache_payload(
+        payload = cache_payload(
             latent_past_kv, cv.layers_list if cv.layers_list is not None else range(len(latent_past_kv.key_cache)))
         if self.latent_mas.profile_timing:
             synchronize_models(cv.A, cv.B)
@@ -354,7 +305,6 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
         if self.latent_mas.profile_timing:
             synchronize_models(cv.A, cv.B)
         receiver_end = time.perf_counter()
-        self.last_segmented_stats = getattr(cv, "last_segmented_stats", None)
 
         context_length = input_ids_B.shape[-1]
         response = self.get_response(output, context_length)
@@ -372,6 +322,7 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
             self.last_inference_stats["per_device_peak_allocated_bytes"] = {
                 str(device): torch.cuda.max_memory_allocated(device)
                 for device in {p.device for m in (cv.A, cv.B) for p in m.parameters() if p.is_cuda}}
+        self.last_prompt_ids = [(input_ids_A[0], input_ids_B[0])]
         return response
 
     # ------------------------------------------------------------------
@@ -392,12 +343,10 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
 
         # 1. Prepare individual input_ids
         ids_A_list, ids_B_list = [], []
-        real_len_B = []
         for item in items:
             ids_A, ids_B = self.prepare_input_ids(item, cv.A, cv.B)
             ids_A_list.append(ids_A[0])
             ids_B_list.append(ids_B[0])
-            real_len_B.append(ids_B[0].shape[0])
 
         # 2. Right-padding input_ids_A for Sender A prefill + latent loop
         max_len_A = max(ids.shape[0] for ids in ids_A_list)
@@ -451,11 +400,12 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
             response_i = self.get_response(outputs[i], max_len_B)
             responses.append(response_i)
 
+        self.last_prompt_ids = list(zip(ids_A_list, ids_B_list))
         return responses
 
     def _test(
         self, model_A, cv=None, limit=None, do_calc_layer_importance=False,
-        do_calc_segmented_importance=False, batch_size=1,
+        batch_size=1,
     ):
         if batch_size != 1 and (self.latent_mas.latent_step_policy != "fixed" or
                                self.latent_mas.sample_seed is not None or self.latent_mas.profile_timing):
@@ -467,9 +417,7 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
         if limit is not None:
             items_all = items_all[:limit]
 
-        if cv.segmented_kv and batch_size != 1:
-            raise ValueError("Segmented Dual-KV currently requires batch_size=1")
-        collecting_importance = do_calc_layer_importance or do_calc_segmented_importance
+        collecting_importance = do_calc_layer_importance
         progress_bar = tqdm(
             range(0, len(items_all), batch_size),
             desc=f"{self.name} result: 0.0000",
@@ -509,15 +457,7 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
                     self.layer_importance_total = calc_layer_importance(
                         cv.B_attn_weights, model_A.name, self.layer_importance_total
                     )
-                if do_calc_segmented_importance:
-                    self.segmented_importance_total = accumulate_segment_masses(
-                        cv.get_segmented_attention_masses(),
-                        totals=self.segmented_importance_total,
-                    )
-
                 for i, (item, resp) in enumerate(zip(batch_items, responses)):
-                    if cv.segmented_kv and self.last_segmented_stats and not collecting_importance:
-                        self.segmented_stats_history.append(dict(self.last_segmented_stats))
                     # resp = clean answer (thinking trace stripped by get_response override)
                     item_metrics = self.evaluator.evaluate_item(item, resp) or {}
 
@@ -526,28 +466,25 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
 
                     # ── Write to responses.jsonl ────────────────────────────
                     if response_log_file is not None:
-                        logged_ids_a, logged_ids_b = self.prepare_input_ids(item, cv.A, cv.B)
+                        logged_ids_a, logged_ids_b = self.last_prompt_ids[i]
                         selected_layers = (
-                            None if cv.segmented_kv
-                            else list(cv.layers_list) if cv.layers_list is not None
+                            list(cv.layers_list) if cv.layers_list is not None
                             else None
                         )
                         total_layers = getattr(cv.A.config, "num_hidden_layers", None)
-                        is_selective = cv.segmented_kv or (
+                        is_selective = (
                             bool(selected_layers) and total_layers is not None
                             and len(selected_layers) < total_layers
                         )
                         method = (
-                            "latentmas_segmented_dual_kv" if cv.segmented_kv
-                            else "latentmas_selective_kv" if is_selective
-                            else "latentmas_full_kv"
+                            latent_method(is_selective, response=True)
                         )
                         record = build_response_record(
                             idx=start_idx + i, evaluator=self.evaluator, item=item,
                             method=method,
                             response=resp,
-                            model_a_prompt=self.tokenizer.decode(logged_ids_a[0], skip_special_tokens=False),
-                            model_b_prompt=self.tokenizer.decode(logged_ids_b[0], skip_special_tokens=False),
+                            model_a_prompt=self.tokenizer.decode(logged_ids_a, skip_special_tokens=False),
+                            model_b_prompt=self.tokenizer.decode(logged_ids_b, skip_special_tokens=False),
                             item_metrics=item_metrics, aggregate_metrics=self.evaluator.get_results(),
                             max_tokens_b=self.generate_args["max_new_tokens"],
                             generated_tokens_a=self.last_latent_length if len(batch_items) == 1 else self.latent_mas.latent_steps,
@@ -555,14 +492,10 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
                                                 if len(batch_items) == 1 else len(self.tokenizer.encode(resp, add_special_tokens=False))),
                             communication_type="latent_kv", latent_steps=(self.last_latent_length if len(batch_items) == 1 else self.latent_mas.latent_steps),
                             layer_selection_mode=(
-                                "segmented" if cv.segmented_kv
-                                else "selected" if is_selective
+                                "selected" if is_selective
                                 else "full"
                             ),
                             selected_layers=selected_layers,
-                            context_layers=cv.segmented_context_layers,
-                            latent_layers=cv.segmented_latent_layers,
-                            segmented_stats=self.last_segmented_stats,
                             adaptive_stats=self.last_inference_stats if len(batch_items) == 1 else None,
                         )
                         response_log_file.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
@@ -578,325 +511,32 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
     @torch.no_grad()
     def test(
         self, model_A, cv, limit=None, no_wandb=False,
-        do_calc_layer_importance=False, do_calc_segmented_importance=False,
+        do_calc_layer_importance=False,
         batch_size=1,
     ):
-        if not do_calc_layer_importance and not do_calc_segmented_importance:
+        if not do_calc_layer_importance:
             for _ in range(self.latent_mas.warmup):
                 self.inference(model_A, cv, self.evaluator.data[0])
         tic = time.time()
         result = self._test(
             model_A, cv, limit=limit,
             do_calc_layer_importance=do_calc_layer_importance,
-            do_calc_segmented_importance=do_calc_segmented_importance,
             batch_size=batch_size,
         )
         toc = time.time()
         time_used = toc - tic
         self.last_time_used = time_used
 
-        if self.use_wandb and not no_wandb and not (
-            do_calc_layer_importance or do_calc_segmented_importance
-        ):
+        if self.use_wandb and not no_wandb and not do_calc_layer_importance:
             import wandb
             wandb.log({f"{self.name}_{key}": value for key, value in self.evaluator.get_results().items() if isinstance(value, (int, float))})
             wandb.log({f"{self.name}_time": time_used})
         logging.info(f"{self.name} result: {result:.4f}, {self.name} time: {time_used:.2f}s")
         return result
 
-    def get_segmented_stats_summary(self):
-        if not self.segmented_stats_history:
-            return None
-        numeric_keys = (
-            "actual_tensor_bytes",
-            "full_tensor_bytes",
-            "byte_retention_ratio",
-            "context_length",
-            "latent_length",
-            "full_kv_token_positions",
-            "retained_kv_token_positions",
-            "logical_retention_ratio",
-        )
-        summary = {
-            f"mean_{key}": sum(float(row[key]) for row in self.segmented_stats_history)
-            / len(self.segmented_stats_history)
-            for key in numeric_keys
-        }
-        summary["num_samples"] = len(self.segmented_stats_history)
-        return summary
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # TextMASEvaluator — Natural-language baseline for LatentMAS (paper-faithful)
 # ──────────────────────────────────────────────────────────────────────────────
 
-class TextMASEvaluator:
-    """
-    TextMAS: Sequential 2-agent text-based baseline, faithful to the LatentMAS paper
-    (arXiv 2511.20639, Section 4 "Models and Baselines").
-
-    Paper definition — "Sequential TextMAS":
-      Following the chain-of-agents design, each agent performs full text-based
-      CoT reasoning and communication; the output of each agent is directly
-      appended to the input of the next agent.
-
-    2-agent pipeline (our instantiation of the paper's 4-agent chain):
-
-      Step 1 — Agent A (Thinker):
-        - Prompt:   build_latent_sender_msg()   [same as LatentMAS condition]
-        - Thinking: FULLY ALLOWED (no </think> suppression)
-        - Budget:   evaluator.max_tokens (uncapped, like paper)
-        - Output:   full_response_A  (complete CoT + answer text)
-
-      Step 2 — Agent B (Solver):
-        - Prompt:   build_latent_receiver_msg() + "\\n\\nAgent A's reasoning:\\n{full_response_A}"
-        - Thinking: FULLY ALLOWED
-        - Budget:   evaluator.max_tokens
-        - Output:   final answer
-
-    Key differences from NLD (the old incorrect implementation):
-      ✓ No </think> suppression for A or B
-      ✓ A generates full CoT (no 128-token cap)
-      ✓ No REFINE_TMPL / B-Phase-1 / debate loop
-      ✓ A's full output is appended directly to B's input context
-      ✓ B generates once only (not refine-style)
-
-    This enables a fair apples-to-apples comparison:
-      TextMAS (text channel, full CoT)  vs  LatentMAS (KV-cache channel, latent steps)
-
-    Args:
-        evaluator:         Task evaluator (e.g. MedQAEvaluator).
-        tokenizer:         Shared tokenizer.
-        use_wandb:         Whether to log metrics to W&B.
-        max_input_length:  Maximum token length for B's input before truncation.
-        response_log_path: Path to JSONL file for logging per-item responses.
-    """
-
-    # Template used to prepend A's reasoning to B's input.
-    # Kept minimal so B sees A's thoughts as pure context, not a debate prompt.
-    _A_CONTEXT_PREFIX = "Agent A's reasoning:\n{response_A}\n\n"
-
-    def __init__(
-        self,
-        evaluator,
-        tokenizer,
-        use_wandb: bool,
-        max_input_length: int,
-        allow_b_think: bool = False,
-        max_tokens_A: int = 0,
-        max_tokens_B: int = 0,
-        response_log_path: str = None,
-    ):
-        from eval import apply_chat_template, is_think_model
-        self._apply_chat_template = apply_chat_template
-        self._is_think_model = is_think_model
-
-        self.evaluator = evaluator
-        self.tokenizer = tokenizer
-        self.use_wandb = use_wandb
-        self.max_input_length = max_input_length
-        self.allow_b_think = allow_b_think
-        self.response_log_path = response_log_path
-        self.name = "textmas"
-
-        self.effective_max_tokens_A, self.effective_max_tokens_B = resolve_textmas_budgets(
-            evaluator, max_tokens_A, max_tokens_B
-        )
-
-        # Sampling params aligned with LatentMAS paper (Section 4):
-        # temperature=0.6, top_p=0.95 — same as LatentCommunicationEvaluator.
-        common_generate_args = {
-            "temperature":    0.6,
-            "top_p":          0.95,
-            "top_k":          None,
-            "num_beams":      1,
-            "do_sample":      True,
-        }
-        self.generate_args_A = {**common_generate_args, "max_new_tokens": self.effective_max_tokens_A}
-        self.generate_args_B = {**common_generate_args, "max_new_tokens": self.effective_max_tokens_B}
-
-        logging.info(
-            f"TextMASEvaluator ready: "
-            f"prompt_family={evaluator.prompt_family}, prompt_version={evaluator.prompt_version}, "
-            f"max_tokens_A={self.effective_max_tokens_A}, max_tokens_B={self.effective_max_tokens_B}, "
-            f"allow_b_think={allow_b_think}, temperature=0.6, top_p=0.95"
-        )
-
-    # ------------------------------------------------------------------
-    # Input preparation
-    # ------------------------------------------------------------------
-
-    def _prepare_input_ids_A(self, item, model_A):
-        """
-        Build tokenised input for Agent A.
-
-        Uses build_latent_sender_msg() — the same framing as LatentMAS.
-        Agent A ALWAYS has allow_b_think=True so that it generates a full reasoning CoT,
-        matching the latent thinking capability of Sender A in LatentMAS.
-        """
-        msg_A = build_latent_sender_msg(
-            self.evaluator, item, is_think=self._is_think_model(model_A)
-        )
-        input_ids_A = self._apply_chat_template(
-            self.evaluator, self.tokenizer, msg_A, model_A,
-            context=False, allow_b_think=True,
-        )
-        return input_ids_A
-
-    def _prepare_input_ids_B(self, item, response_A, model_B):
-        """
-        Build tokenised input for Agent B.
-
-        B receives:
-          build_text_receiver_msg() with Agent A's reasoning naturally formatted
-          between role introduction and target question.
-          ← sequential natural language communication baseline.
-
-        Respects self.allow_b_think for B as well.
-
-        Truncation: if the combined prompt exceeds max_input_length, we
-        truncate the middle (same strategy as CommunicationEvaluator).
-        """
-        msg_B = build_text_receiver_msg(
-            self.evaluator, item, response_A=response_A, allow_b_think=self.allow_b_think
-        )
-
-        input_ids_B = self._apply_chat_template(
-            self.evaluator, self.tokenizer, msg_B, model_B,
-            context=False, allow_b_think=self.allow_b_think,
-        )
-
-        # Truncate in the middle if over budget
-        if input_ids_B.shape[-1] > self.max_input_length and self.evaluator.truncate_input:
-            half = self.max_input_length // 2
-            input_ids_B = torch.cat(
-                [input_ids_B[:, :half], input_ids_B[:, -half:]], dim=-1
-            )
-        return input_ids_B
-
-    # ------------------------------------------------------------------
-    # Response decoding
-    # ------------------------------------------------------------------
-
-    def get_response(self, output, context_length):
-        """
-        Decode output tokens after context_length.
-
-        For think-models: strip <think>...</think> before returning to
-        the evaluator so scoring runs on the clean final answer only.
-        (Same fix as LatentCommunicationEvaluator.get_response.)
-        """
-        response = self.tokenizer.decode(
-            output[context_length:], skip_special_tokens=True
-        ).strip()
-        # Strip thinking trace — present when allow_b_think=True
-        if "</think>" in response:
-            after_think = response.split("</think>", 1)[1].strip()
-            return after_think if after_think else response
-        return response
-
-    # ------------------------------------------------------------------
-    # Single-sample inference
-    # ------------------------------------------------------------------
-
-    @torch.no_grad()
-    def inference(self, model_A, model_B, item):
-        """
-        Run one TextMAS inference step.
-
-        Step 1: Agent A processes its prompt and generates a full CoT response.
-        Step 2: Agent B receives A's full response as context and generates
-                the final answer.
-        """
-        input_ids_A = self._prepare_input_ids_A(item, model_A)
-
-        # ── Step 1: A generates full CoT (thinking fully enabled) ─────────
-        output_A = model_A.generate(
-            input_ids_A,
-            attention_mask=torch.ones_like(input_ids_A),
-            **self.generate_args_A,
-        )[0]
-        response_A = self.tokenizer.decode(
-            output_A[input_ids_A.shape[-1]:], skip_special_tokens=True
-        ).strip()
-
-        # ── Step 2: B generates final answer with A's full output ──────────
-        input_ids_B = self._prepare_input_ids_B(item, response_A, model_B)
-        output_B = model_B.generate(
-            input_ids_B,
-            attention_mask=torch.ones_like(input_ids_B),
-            **self.generate_args_B,
-        )[0]
-        response_B = self.get_response(output_B, input_ids_B.shape[-1])
-        return {
-            "response_A": response_A,
-            "response_B": response_B,
-            "generated_tokens_A": int(output_A.shape[-1] - input_ids_A.shape[-1]),
-            "generated_tokens_B": int(output_B.shape[-1] - input_ids_B.shape[-1]),
-            "model_A_prompt": self.tokenizer.decode(input_ids_A[0], skip_special_tokens=False),
-            "model_B_prompt": self.tokenizer.decode(input_ids_B[0], skip_special_tokens=False),
-        }
-
-    # ------------------------------------------------------------------
-    # Evaluation loop
-    # ------------------------------------------------------------------
-
-    def _test(self, model_A, model_B, limit=None):
-        items_all = list(self.evaluator)
-        if limit is not None:
-            items_all = items_all[:limit]
-
-        progress_bar = tqdm(items_all, desc=f"{self.name} result: 0.0000")
-
-        response_log_file = None
-        if self.response_log_path:
-            response_log_file = open(self.response_log_path, "a", encoding="utf-8")
-
-        try:
-            for i, item in enumerate(progress_bar):
-                try:
-                    inference_result = self.inference(model_A, model_B, item)
-                except Exception as e:
-                    logging.error(f"TextMAS inference error at item {i}: {e}")
-                    continue
-
-                response = inference_result["response_B"]
-                item_metrics = self.evaluator.evaluate_item(item, response) or {}
-
-                result = self.evaluator.get_result()
-                progress_bar.set_description(f"{self.name} {self.evaluator.primary_metric}: {result:.4f}")
-
-                if response_log_file is not None:
-                    record = build_response_record(
-                        idx=i, evaluator=self.evaluator, item=item, method="textmas_two_agent",
-                        response=response, response_a=inference_result["response_A"],
-                        model_a_prompt=inference_result["model_A_prompt"],
-                        model_b_prompt=inference_result["model_B_prompt"],
-                        item_metrics=item_metrics, aggregate_metrics=self.evaluator.get_results(),
-                        max_tokens_a=self.effective_max_tokens_A, max_tokens_b=self.effective_max_tokens_B,
-                        generated_tokens_a=inference_result["generated_tokens_A"],
-                        generated_tokens_b=inference_result["generated_tokens_B"],
-                        communication_type="text",
-                    )
-                    response_log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
-                    response_log_file.flush()
-
-        finally:
-            if response_log_file is not None:
-                response_log_file.close()
-
-        return self.evaluator.get_result()
-
-    @torch.no_grad()
-    def test(self, model_A, model_B, limit=None):
-        tic = time.time()
-        result = self._test(model_A, model_B, limit)
-        toc = time.time()
-        time_used = toc - tic
-        if self.use_wandb:
-            import wandb
-            wandb.log({f"{self.name}_{key}": value for key, value in self.evaluator.get_results().items() if isinstance(value, (int, float))})
-            wandb.log({f"{self.name}_time": time_used})
-        logging.info(f"{self.name} result: {result:.4f}, {self.name} time: {time_used:.2f}s")
-        return result
+# Backward-compatible import for existing callers.
+from eval_textmas import TextMASEvaluator
 

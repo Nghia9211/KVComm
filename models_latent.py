@@ -51,7 +51,6 @@ class LatentMAS:
         model: PreTrainedModel,
         latent_steps: int = 5,
         latent_space_realign: bool = True,
-        track_convergence: bool = False,
         latent_step_policy: str = "fixed",
         min_latent_steps: int = 10,
         latent_check_interval: int = 5,
@@ -71,10 +70,7 @@ class LatentMAS:
             latent_space_realign: If True, project hidden state back to
                 embedding space via learned linear map W = (E_out^T E_out)^{-1} E_out^T E_in.
                 If False, only L2-normalize (identity realignment).
-            track_convergence: If True, compute and log cosine similarity between
-                consecutive hidden states h^(n) and h^(n-1) after each latent step.
-                Results are stored in self.convergence_history (reset on each run() call).
-                Adds negligible overhead (one cosine_similarity call per step).
+            latent_trace: Record per-step features for offline analysis without changing stopping.
         """
         self.model = model
         self.latent_steps = latent_steps
@@ -94,13 +90,6 @@ class LatentMAS:
         self.warmup = warmup
         self.last_run_stats = {}
         self.latent_space_realign = latent_space_realign
-        # §3.2 Convergence tracking: log cosine similarity between consecutive
-        # hidden states h^(n) and h^(n-1) to observe convergence rate.
-        # No auto-stop — purely for analysis.
-        self.track_convergence = track_convergence
-        # Populated during each run() call; list of cosine similarity values.
-        self.convergence_history: list[float] = []
-
         self._realign_matrix: Optional[torch.Tensor] = None
         self._target_norm: Optional[torch.Tensor] = None
 
@@ -111,7 +100,7 @@ class LatentMAS:
         logging.info(
             f"LatentMAS initialized: latent_steps={latent_steps}, "
             f"latent_space_realign={latent_space_realign}, "
-            f"track_convergence={track_convergence}"
+            f"latent_trace={latent_trace}"
         )
 
     # ------------------------------------------------------------------
@@ -313,16 +302,14 @@ class LatentMAS:
 
         Mode 1 (latent_kv_select=False): cv has all layers -> full cache passes through.
         Mode 2 (latent_kv_select=True): cv.prepare_key_cache() selects layers.
-        Mode 5 (segmented_kv_select=True): the communicator independently
-        selects the pre-latent input and latent-token segments per layer.
 
         Args:
             input_ids:    [B, T] token ids.
             attention_mask: [B, T] mask (default: all ones). Handles right-padded batches.
         Returns:
             Full DynamicCache with shape per layer
-            ``[B, kv_heads, T_input + latent_steps, head_dim]``.  Segment
-            selection, when requested, happens later in CVCommunicator.
+            ``[B, kv_heads, T_input + actual_steps, head_dim]``.
+            Whole-layer selection happens later in CVCommunicator.
         """
         if input_ids.dim() != 2:
             raise ValueError(
@@ -332,7 +319,6 @@ class LatentMAS:
         if self.latent_step_policy != "fixed" and input_ids.shape[0] != 1:
             raise ValueError("Adaptive latent steps require batch_size=1")
         controller = StopController(max_steps=self.latent_steps, **self.controller_args)
-        self.convergence_history = []
         self.last_run_stats = {}
         buffered_features = []
         actual_steps = 0
@@ -429,13 +415,13 @@ class LatentMAS:
             check = controller.should_check(actual_steps)
             features = None
             at_adaptive_cap = self.latent_step_policy != "fixed" and actual_steps == self.latent_steps
-            if check or at_adaptive_cap or self.latent_trace or self.track_convergence:
+            if check or at_adaptive_cap or self.latent_trace:
                 check_start = time.perf_counter()
                 packed = feature_tensor(prev_hidden, last_hidden, past,
                                         input_ids.shape[-1], feature_config,
                                         include_values=bool(feature_config.value_layers) and
                                         (self.latent_step_policy == "hidden_value" or self.latent_trace))
-                if self.latent_trace or self.track_convergence:
+                if self.latent_trace:
                     buffered_features.append((actual_steps, packed))
                 if check or at_adaptive_cap:
                     features = decode_features(packed.cpu().tolist())
@@ -450,7 +436,7 @@ class LatentMAS:
                 f"past_len={past.get_seq_length()}"
             )
 
-        # Preserve the semantic boundary for Segmented Dual-KV.  These are
+        # Preserve actual context/latent lengths for logging and cache invariants. These are
         # ordinary Python attributes on DynamicCache and do not alter tensors.
         past._kvcomm_context_length = int(input_ids.shape[-1])
         past._kvcomm_latent_length = actual_steps
@@ -465,8 +451,6 @@ class LatentMAS:
             rows = torch.stack([entry[1] for entry in buffered_features]).cpu().tolist()
             trace = [dict(step=entry[0], **decode_features(row))
                      for entry, row in zip(buffered_features, rows)]
-            if self.track_convergence:
-                self.convergence_history = [1 - row["cosine_distance"] for row in trace]
         self.last_run_stats = {
             "adaptive_schema_version": 1, "policy": self.latent_step_policy,
             "policy_config_hash": self.policy_config_hash,

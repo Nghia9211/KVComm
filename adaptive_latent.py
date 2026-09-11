@@ -19,7 +19,7 @@ def inference_code_hash(root):
     from pathlib import Path
     root = Path(root)
     paths = [root / name for name in ("models.py", "model_attn.py", "models_latent.py",
-        "adaptive_latent.py", "eval.py", "eval_latent.py", "prompts_latent.py", "segmented_kv.py")]
+        "adaptive_latent.py", "eval.py", "eval_latent.py", "eval_textmas.py", "prompts_latent.py")]
     paths += sorted((root / "dataloader").glob("*.py")) + sorted((root / "utils").glob("*.py"))
     return content_hash({str(path.relative_to(root)).replace("\\", "/"):
                          hashlib.sha256(path.read_bytes()).hexdigest() for path in paths})
@@ -217,7 +217,7 @@ def validate_runtime(cfg):
                    cfg.latent_check_interval, cfg.latent_patience, config)
     adaptive = cfg.latent_step_policy != "fixed"
     if adaptive:
-        if not cfg.do_test_latent or cfg.dual_kv_select or cfg.segmented_kv_select:
+        if not cfg.do_test_latent:
             raise ValueError("Adaptive v1 supports only latent Mode 1/2")
         if cfg.model_A != cfg.model_B or "qwen3" not in cfg.model_A.lower():
             raise ValueError("Adaptive v1 requires identical Qwen3 A/B models")
