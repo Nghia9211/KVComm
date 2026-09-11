@@ -57,6 +57,7 @@ from models import CVCommunicator
 from prompts_latent import build_latent_sender_msg, build_latent_receiver_msg, build_text_receiver_msg
 from utils.response_logging import build_response_record
 from utils.evaluation_config import resolve_textmas_budgets
+from adaptive_latent import sample_id, sample_rng, decoding_seed, synchronize_models, cache_payload, content_hash
 
 
 class LatentCommunicationEvaluator(CommunicationEvaluator):
@@ -143,6 +144,9 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
         self.generate_args["top_p"]        = 0.95
         self.generate_args["top_k"]        = None
         self.generate_args["do_sample"]    = True
+        if latent_mas.greedy:
+            self.generate_args.update(do_sample=False, temperature=None, top_p=None)
+        self.last_inference_stats = {}
 
         logging.info(
             f"LatentCommunicationEvaluator ready: "
@@ -290,6 +294,12 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
             str: decoded response from model_B.
         """
         # ── Input preparation (now uses overridden prepare_input_ids) ─────
+        if self.latent_mas.profile_timing:
+            synchronize_models(cv.A, cv.B)
+            for device in {p.device for m in (cv.A, cv.B) for p in m.parameters() if p.is_cuda}:
+                torch.cuda.reset_peak_memory_stats(device)
+        inference_start = time.perf_counter()
+        identity = sample_id(item)
         input_ids_A, input_ids_B = self.prepare_input_ids(item, cv.A, cv.B)
 
         # ── Latent thinking ───────────────────────────────────────────────
@@ -300,7 +310,7 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
             attention_mask=torch.ones_like(input_ids_A),
         )
         self.last_context_length = int(input_ids_A.shape[-1])
-        self.last_latent_length = int(self.latent_mas.latent_steps)
+        self.last_latent_length = int(latent_past_kv._kvcomm_latent_length)
         cv.configure_segmented_attention_capture(
             self.last_context_length, self.last_latent_length
         )
@@ -329,16 +339,40 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
         # cv.generate() → prepare_key_cache(latent_past_kv)
         #               → layer selection (Mode 2) or identity (Mode 1)
         #               → model_B.generate với attention_mask_B đúng
-        output = cv.generate(
-            input_ids_B,
-            attention_mask=attention_mask_B,  # ← Bao gồm cả T_A + N_latent tokens
-            out_A_past_key_values=latent_past_kv,
-            **self.generate_args,
-        )[0]
+        payload = {} if cv.segmented_kv else cache_payload(
+            latent_past_kv, cv.layers_list if cv.layers_list is not None else range(len(latent_past_kv.key_cache)))
+        if self.latent_mas.profile_timing:
+            synchronize_models(cv.A, cv.B)
+        receiver_start = time.perf_counter()
+        with sample_rng(self.latent_mas.sample_seed, identity):
+            output = cv.generate(
+                input_ids_B,
+                attention_mask=attention_mask_B,
+                out_A_past_key_values=latent_past_kv,
+                **self.generate_args,
+            )[0]
+        if self.latent_mas.profile_timing:
+            synchronize_models(cv.A, cv.B)
+        receiver_end = time.perf_counter()
         self.last_segmented_stats = getattr(cv, "last_segmented_stats", None)
 
         context_length = input_ids_B.shape[-1]
-        return self.get_response(output, context_length)
+        response = self.get_response(output, context_length)
+        self.last_inference_stats = dict(self.latent_mas.last_run_stats,
+            sample_id=identity, status="ok", **payload,
+            prompt_A_token_hash=content_hash(input_ids_A[0].tolist()),
+            prompt_B_token_hash=content_hash(input_ids_B[0].tolist()),
+            decoding_seed=(decoding_seed(self.latent_mas.sample_seed, identity)
+                           if self.latent_mas.sample_seed is not None else None),
+            generated_B_token_count_raw=int(output.shape[-1] - context_length),
+            B_generation_including_handoff_ms=(receiver_end - receiver_start) * 1000,
+            kv_handoff_ms=None,  # routing is lazy inside cv.forward; do not double count
+            end_to_end_ms=(time.perf_counter() - inference_start) * 1000)
+        if self.latent_mas.profile_timing:
+            self.last_inference_stats["per_device_peak_allocated_bytes"] = {
+                str(device): torch.cuda.max_memory_allocated(device)
+                for device in {p.device for m in (cv.A, cv.B) for p in m.parameters() if p.is_cuda}}
+        return response
 
     # ------------------------------------------------------------------
     # Batched Evaluation (batch_size > 1)
@@ -423,6 +457,9 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
         self, model_A, cv=None, limit=None, do_calc_layer_importance=False,
         do_calc_segmented_importance=False, batch_size=1,
     ):
+        if batch_size != 1 and (self.latent_mas.latent_step_policy != "fixed" or
+                               self.latent_mas.sample_seed is not None or self.latent_mas.profile_timing):
+            raise ValueError("Adaptive/per-sample RNG/timing require batch_size=1")
         if cv is None:
             return super()._test(model_A, limit=limit, do_calc_layer_importance=do_calc_layer_importance)
 
@@ -450,10 +487,22 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
                 batch_items = items_all[start_idx : start_idx + batch_size]
                 # When computing layer importance, always use single-item inference to
                 # get per-item attention weights via cv.calc_attn_weights_from_qk()
-                if len(batch_items) > 1 and not collecting_importance:
-                    responses = self.inference_batch(cv, batch_items)
-                else:
-                    responses = [self.inference(model_A, cv, item) for item in batch_items]
+                try:
+                    if len(batch_items) > 1 and not collecting_importance:
+                        responses = self.inference_batch(cv, batch_items)
+                    else:
+                        responses = [self.inference(model_A, cv, item) for item in batch_items]
+                except Exception as exc:
+                    if response_log_file is not None:
+                        response_log_file.write(json.dumps({
+                            "adaptive_schema_version": 1, "status": "error",
+                            "sample_ids": [sample_id(item) for item in batch_items],
+                            "policy": self.latent_mas.latent_step_policy,
+                            "configured_max_steps": self.latent_mas.latent_steps,
+                            "error_type": type(exc).__name__, "error": str(exc),
+                        }, ensure_ascii=False) + "\n")
+                        response_log_file.flush()
+                    raise
 
                 if do_calc_layer_importance:
                     cv.calc_attn_weights_from_qk()
@@ -501,9 +550,10 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
                             model_b_prompt=self.tokenizer.decode(logged_ids_b[0], skip_special_tokens=False),
                             item_metrics=item_metrics, aggregate_metrics=self.evaluator.get_results(),
                             max_tokens_b=self.generate_args["max_new_tokens"],
-                            generated_tokens_a=self.latent_mas.latent_steps,
-                            generated_tokens_b=len(self.tokenizer.encode(resp, add_special_tokens=False)),
-                            communication_type="latent_kv", latent_steps=self.latent_mas.latent_steps,
+                            generated_tokens_a=self.last_latent_length if len(batch_items) == 1 else self.latent_mas.latent_steps,
+                            generated_tokens_b=(self.last_inference_stats["generated_B_token_count_raw"]
+                                                if len(batch_items) == 1 else len(self.tokenizer.encode(resp, add_special_tokens=False))),
+                            communication_type="latent_kv", latent_steps=(self.last_latent_length if len(batch_items) == 1 else self.latent_mas.latent_steps),
                             layer_selection_mode=(
                                 "segmented" if cv.segmented_kv
                                 else "selected" if is_selective
@@ -513,8 +563,9 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
                             context_layers=cv.segmented_context_layers,
                             latent_layers=cv.segmented_latent_layers,
                             segmented_stats=self.last_segmented_stats,
+                            adaptive_stats=self.last_inference_stats if len(batch_items) == 1 else None,
                         )
-                        response_log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+                        response_log_file.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
                         response_log_file.flush()
 
         finally:
@@ -530,6 +581,9 @@ class LatentCommunicationEvaluator(CommunicationEvaluator):
         do_calc_layer_importance=False, do_calc_segmented_importance=False,
         batch_size=1,
     ):
+        if not do_calc_layer_importance and not do_calc_segmented_importance:
+            for _ in range(self.latent_mas.warmup):
+                self.inference(model_A, cv, self.evaluator.data[0])
         tic = time.time()
         result = self._test(
             model_A, cv, limit=limit,

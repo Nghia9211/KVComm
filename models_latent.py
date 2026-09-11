@@ -10,8 +10,11 @@ out_A_past_key_values → prepare_key_cache().
 """
 
 import torch
-import torch.nn.functional as F
 import logging
+import time
+from dataclasses import asdict
+from adaptive_latent import (PolicyConfig, StopController, feature_tensor,
+                             decode_features, synchronize_models)
 from typing import Optional
 from transformers.cache_utils import DynamicCache
 from transformers.modeling_utils import PreTrainedModel
@@ -49,6 +52,17 @@ class LatentMAS:
         latent_steps: int = 5,
         latent_space_realign: bool = True,
         track_convergence: bool = False,
+        latent_step_policy: str = "fixed",
+        min_latent_steps: int = 10,
+        latent_check_interval: int = 5,
+        latent_patience: int = 2,
+        policy_config: Optional[PolicyConfig] = None,
+        policy_config_hash: Optional[str] = None,
+        latent_trace: bool = False,
+        profile_timing: bool = False,
+        greedy: bool = False,
+        sample_seed: Optional[int] = None,
+        warmup: int = 0,
     ) -> None:
         """
         Args:
@@ -64,6 +78,21 @@ class LatentMAS:
         """
         self.model = model
         self.latent_steps = latent_steps
+        self.latent_step_policy = latent_step_policy
+        self.policy_config = policy_config
+        self.policy_config_hash = policy_config_hash
+        self.controller_args = dict(policy=latent_step_policy, min_steps=min_latent_steps,
+                                    interval=latent_check_interval, patience=latent_patience,
+                                    config=policy_config)
+        StopController(max_steps=latent_steps, **self.controller_args)
+        self.latent_trace = latent_trace
+        self.profile_timing = profile_timing
+        self.greedy = greedy
+        self.sample_seed = sample_seed
+        if warmup < 0:
+            raise ValueError("warmup must be nonnegative")
+        self.warmup = warmup
+        self.last_run_stats = {}
         self.latent_space_realign = latent_space_realign
         # §3.2 Convergence tracking: log cosine similarity between consecutive
         # hidden states h^(n) and h^(n-1) to observe convergence rate.
@@ -300,9 +329,21 @@ class LatentMAS:
                 f"input_ids must be 2D [batch, seq_len], got shape {tuple(input_ids.shape)}"
             )
 
-        # Reset per-run convergence history
-        if self.track_convergence:
-            self.convergence_history = []
+        if self.latent_step_policy != "fixed" and input_ids.shape[0] != 1:
+            raise ValueError("Adaptive latent steps require batch_size=1")
+        controller = StopController(max_steps=self.latent_steps, **self.controller_args)
+        self.convergence_history = []
+        self.last_run_stats = {}
+        buffered_features = []
+        actual_steps = 0
+        reason = "fixed_budget" if self.latent_step_policy == "fixed" else "max_steps"
+        controller_ms = 0.0
+        feature_config = self.policy_config or PolicyConfig(cosine_distance=0.0)
+        if any(i >= self.model.config.num_hidden_layers for i in feature_config.value_layers):
+            raise ValueError("value_layers contains an out-of-range model layer")
+        if self.profile_timing:
+            synchronize_models(self.model)
+        prefill_start = time.perf_counter()
 
         # Resolve the input device: use the embedding layer's device so that
         # input_ids land on the first real compute device, even with
@@ -342,6 +383,9 @@ class LatentMAS:
         last_token_idx = attention_mask.sum(1).long() - 1         # [B]
         batch_idx      = torch.arange(input_ids.shape[0], device=device)
         last_hidden    = outputs.hidden_states[-1][batch_idx, last_token_idx, :]  # [B, D]
+        if self.profile_timing:
+            synchronize_models(self.model)
+        latent_start = time.perf_counter()
 
         # ── Step 2: Latent loop ────────────────────────────────────────
         # Ported from generate_latent_batch() L334-362
@@ -381,18 +425,25 @@ class LatentMAS:
             prev_hidden = last_hidden  # store before updating
             last_hidden = outputs.hidden_states[-1][:, -1, :]       # [B, D]
 
-            # §3.2 Convergence tracking: log cosine similarity between
-            # h^(step) (prev_hidden) and h^(step+1) (last_hidden).
-            # Cosine sim ≈ 1.0 means the latent loop has converged.
-            if self.track_convergence:
-                cos_sim = F.cosine_similarity(
-                    last_hidden.float(), prev_hidden.float(), dim=-1
-                ).mean().item()
-                self.convergence_history.append(cos_sim)
-                logging.info(
-                    f"Latent convergence [{step+1}/{self.latent_steps}]: "
-                    f"cosine_sim(h[{step}]→h[{step+1}])={cos_sim:.4f}"
-                )
+            actual_steps = step + 1
+            check = controller.should_check(actual_steps)
+            features = None
+            at_adaptive_cap = self.latent_step_policy != "fixed" and actual_steps == self.latent_steps
+            if check or at_adaptive_cap or self.latent_trace or self.track_convergence:
+                check_start = time.perf_counter()
+                packed = feature_tensor(prev_hidden, last_hidden, past,
+                                        input_ids.shape[-1], feature_config,
+                                        include_values=bool(feature_config.value_layers) and
+                                        (self.latent_step_policy == "hidden_value" or self.latent_trace))
+                if self.latent_trace or self.track_convergence:
+                    buffered_features.append((actual_steps, packed))
+                if check or at_adaptive_cap:
+                    features = decode_features(packed.cpu().tolist())
+                controller_ms += (time.perf_counter() - check_start) * 1000
+            decision = controller.observe(actual_steps, features)
+            if decision:
+                reason = decision
+                break
 
             logging.debug(
                 f"Latent step {step + 1}/{self.latent_steps}: "
@@ -402,7 +453,34 @@ class LatentMAS:
         # Preserve the semantic boundary for Segmented Dual-KV.  These are
         # ordinary Python attributes on DynamicCache and do not alter tensors.
         past._kvcomm_context_length = int(input_ids.shape[-1])
-        past._kvcomm_latent_length = int(self.latent_steps)
-        past._kvcomm_logical_length = int(input_ids.shape[-1] + self.latent_steps)
+        past._kvcomm_latent_length = actual_steps
+        past._kvcomm_logical_length = int(input_ids.shape[-1] + actual_steps)
+        if past.get_seq_length() != past._kvcomm_logical_length:
+            raise RuntimeError("Sender cache length differs from completed latent forwards")
+        if self.profile_timing:
+            synchronize_models(self.model)
+        latent_end = time.perf_counter()
+        trace = []
+        if buffered_features:
+            rows = torch.stack([entry[1] for entry in buffered_features]).cpu().tolist()
+            trace = [dict(step=entry[0], **decode_features(row))
+                     for entry, row in zip(buffered_features, rows)]
+            if self.track_convergence:
+                self.convergence_history = [1 - row["cosine_distance"] for row in trace]
+        self.last_run_stats = {
+            "adaptive_schema_version": 1, "policy": self.latent_step_policy,
+            "policy_config_hash": self.policy_config_hash,
+            "feature_config": asdict(feature_config),
+            "configured_max_steps": self.latent_steps, "actual_steps": actual_steps,
+            "stop_reason": reason, "decision_checkpoints": controller.checkpoints,
+            "context_length": int(input_ids.shape[-1]),
+            "actual_cache_length_before_B": past.get_seq_length(),
+            "feature_trace": trace if self.latent_trace else [],
+            "timing_synchronized": self.profile_timing,
+            "prefill_A_ms": (latent_start - prefill_start) * 1000 if self.profile_timing else None,
+            "latent_A_ms_including_controller": (latent_end - latent_start) * 1000 if self.profile_timing else None,
+            "controller_host_ms_diagnostic": controller_ms,
+        }
+        past._kvcomm_adaptive_stats = self.last_run_stats
 
         return past

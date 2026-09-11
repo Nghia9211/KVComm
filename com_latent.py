@@ -70,6 +70,8 @@ import gc
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Literal
+from pathlib import Path
+import transformers
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.trainer_utils import set_seed
 
@@ -82,6 +84,8 @@ from dataloader import get_evaluator
 from layer_importance import get_top_layers, get_layer_ranking
 from segmented_kv import select_segmented_layers
 from prompts_latent import build_sender_core, build_receiver_core
+from adaptive_latent import validate_runtime, sample_id, inference_code_hash
+from utils.latent_samples import load_manifest
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -116,6 +120,18 @@ class LatentAlignConfig:
 
     # ── Latent params ──────────────────────────────────────────────────────
     latent_steps: int = 5
+    latent_step_policy: str = "fixed"
+    min_latent_steps: int = 10
+    latent_check_interval: int = 5
+    latent_patience: int = 2
+    latent_policy_config: str = ""
+    latent_trace: bool = False
+    profile_timing: bool = False
+    latent_warmup: int = 0
+    greedy: bool = False
+    per_sample_seed: bool = False
+    sample_manifest: str = ""
+    sample_split: str = "holdout"
     latent_space_realign: bool = True
     # latent_kv_select=False → Mode 1 (all layers, LatentMAS standalone)
     # latent_kv_select=True  → Mode 2 (layer selection via CVCommunicator)
@@ -218,6 +234,14 @@ def generate_latent_run_name(cfg: LatentAlignConfig) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main(cfg: LatentAlignConfig):
+    policy_config, policy_document, policy_hash = validate_runtime(cfg)
+    sample_items, sample_document = (load_manifest(cfg.sample_manifest, cfg.test_task, cfg.sample_split)
+                                      if cfg.sample_manifest else (None, None))
+    if sample_items is not None and cfg.sample_split == "holdout" and policy_document:
+        provenance = policy_document.get("provenance", {})
+        used = set(provenance.get("calibration_sample_ids", [])) | set(provenance.get("validation_sample_ids", []))
+        if used & {sample_id(item) for item in sample_items}:
+            raise ValueError("Holdout overlaps samples used to select this policy")
     set_seed(cfg.seed)
     os.makedirs(cfg.snapshot_path, exist_ok=True)
 
@@ -228,6 +252,8 @@ def main(cfg: LatentAlignConfig):
         run_name = cfg.run_name
         if getattr(cfg, "test_task", "") and not run_name.startswith(f"{cfg.test_task}_"):
             run_name = f"{cfg.test_task}_{run_name}"
+    if cfg.latent_step_policy != "fixed":
+        run_name += f"_{cfg.latent_step_policy}_cap{cfg.latent_steps}_{policy_hash[:8]}"
     run_name  = f"{run_name}_{timestamp}"
 
     final_snapshot_path = os.path.join(cfg.snapshot_path, run_name)
@@ -298,6 +324,8 @@ def main(cfg: LatentAlignConfig):
         torch._dynamo.config.cache_size_limit = 64
 
     evaluator = get_evaluator(cfg.test_task)
+    if sample_items is not None:
+        evaluator.data = sample_items
     first_item = evaluator.data[0] if len(evaluator) else None
     sender_core = build_sender_core(evaluator, first_item, is_think=is_think_model(model_A)) if first_item else ""
     receiver_core = build_receiver_core(evaluator, first_item, allow_b_think=cfg.allow_b_think) if first_item else ""
@@ -333,9 +361,34 @@ def main(cfg: LatentAlignConfig):
         "allow_b_think": cfg.allow_b_think,
         "segmented_kv_select": cfg.segmented_kv_select,
         "legacy_dual_kv_select": cfg.dual_kv_select,
-        "temperature": 0.6,
-        "top_p": 0.95,
-        "do_sample": True,
+        "temperature": None if cfg.greedy else 0.6,
+        "top_p": None if cfg.greedy else 0.95,
+        "do_sample": not cfg.greedy,
+        "latent_step_policy": cfg.latent_step_policy,
+        "policy_config_hash": policy_hash,
+        "policy_document": policy_document,
+        "min_latent_steps": cfg.min_latent_steps,
+        "latent_check_interval": cfg.latent_check_interval,
+        "latent_patience": cfg.latent_patience,
+        "per_sample_seed": cfg.per_sample_seed or cfg.latent_step_policy != "fixed",
+        "latent_trace": cfg.latent_trace,
+        "profile_timing": cfg.profile_timing,
+        "latent_warmup": cfg.latent_warmup,
+        "sample_ids": [sample_id(row) for row in (sample_items if sample_items is not None else evaluator.data)][:cfg.limit or None],
+        "model_A_commit": getattr(model_A.config, "_commit_hash", None),
+        "model_B_commit": getattr(model_B.config, "_commit_hash", None),
+        "sample_manifest_hash": sample_document["manifest_hash"] if sample_document else None,
+        "sample_split": cfg.sample_split if sample_document else None,
+        "torch_version": torch.__version__,
+        "transformers_version": transformers.__version__,
+        "inference_code_hash": inference_code_hash(Path(__file__).parent),
+        "shift_back": cfg.shift_back,
+        "latent_space_realign": cfg.latent_space_realign,
+        "max_input_length": cfg.max_input_length,
+        "backend": "sdpa",
+        "dtype": "bfloat16",
+        "device_map_A": str(getattr(model_A, "hf_device_map", cfg.device)),
+        "device_map_B": str(getattr(model_B, "hf_device_map", cfg.device_B)),
         "first_sender_core_sha256": hashlib.sha256(sender_core.encode("utf-8")).hexdigest(),
         "first_receiver_core_sha256": hashlib.sha256(receiver_core.encode("utf-8")).hexdigest(),
     }
@@ -425,6 +478,17 @@ def main(cfg: LatentAlignConfig):
             latent_steps=cfg.latent_steps,
             latent_space_realign=cfg.latent_space_realign,
             track_convergence=cfg.track_convergence,
+            latent_step_policy=cfg.latent_step_policy,
+            min_latent_steps=cfg.min_latent_steps,
+            latent_check_interval=cfg.latent_check_interval,
+            latent_patience=cfg.latent_patience,
+            policy_config=policy_config,
+            policy_config_hash=policy_hash,
+            latent_trace=cfg.latent_trace,
+            profile_timing=cfg.profile_timing,
+            warmup=cfg.latent_warmup,
+            greedy=cfg.greedy,
+            sample_seed=cfg.seed if cfg.per_sample_seed or cfg.latent_step_policy != "fixed" else None,
         )
 
         # ── Resolve A_num_layers (shared across all modes) ────────────────

@@ -32,6 +32,8 @@ TRACK_CONVERGENCE=false
 SHIFT_BACK=true
 DRY_RUN=false
 PYTHON_OVERRIDE=""
+POLICY="fixed"
+ADAPTIVE_ARGS=()
 
 usage() {
   cat <<'EOF'
@@ -67,6 +69,14 @@ Layer selection:
   --split_ratio FLOAT --context_top_ratio FLOAT --latent_top_ratio FLOAT
   --track_convergence --no_shift_back
 
+Adaptive (m1/m2; Mode 2 needs frozen --layers_list):
+  --latent_step_policy fixed|cosine|hidden_value
+  --latent_policy_config PATH --min_latent_steps N
+  --latent_check_interval N --latent_patience N
+  --latent_trace --greedy --per_sample_seed --profile_timing
+  --sample_manifest PATH --sample_split calibration|validation|holdout|historical
+  --steps is the hard cap for adaptive; the JSON controller must match it.
+
 Examples:
   bash sweep_latent.sh --task "hotpotqa tmath" --steps "1 2 5" --mode both --dry_run
   bash sweep_latent.sh --task qa --mode all --steps "1 5" --limit 10
@@ -100,6 +110,11 @@ while [[ $# -gt 0 ]]; do
     --context_top_ratio) CONTEXT_TOP_RATIO="$2"; shift 2 ;;
     --latent_top_ratio) LATENT_TOP_RATIO="$2"; shift 2 ;;
     --track_convergence) TRACK_CONVERGENCE=true; shift ;;
+    --latent_step_policy) POLICY="$2"; shift 2 ;;
+    --latent_policy_config|--min_latent_steps|--latent_check_interval|--latent_patience|--latent_warmup|--sample_manifest|--sample_split)
+      ADAPTIVE_ARGS+=("$1" "$2"); shift 2 ;;
+    --latent_trace|--greedy|--per_sample_seed|--profile_timing)
+      ADAPTIVE_ARGS+=("$1"); shift ;;
     --no_shift_back) SHIFT_BACK=false; shift ;;
     --dry_run) DRY_RUN=true; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -130,6 +145,14 @@ esac
 read -r -a TASKS <<< "$TASK_STRING"
 read -r -a LATENT_STEPS <<< "$STEPS"
 read -r -a EXPLICIT_LAYERS <<< "$LAYERS_LIST"
+if [[ "$POLICY" != fixed ]]; then
+  if [[ "$MODE" != m1 && "$MODE" != m2 && "$MODE" != both ]]; then
+    echo "[ERROR] Adaptive supports only m1/m2/both" >&2; exit 2
+  fi
+  if [[ "$MODE" != m1 && ${#EXPLICIT_LAYERS[@]} -eq 0 ]]; then
+    echo "[ERROR] Adaptive Mode 2 needs frozen --layers_list" >&2; exit 2
+  fi
+fi
 
 if [[ ${#TASKS[@]} -eq 0 ]]; then echo "[ERROR] No tasks selected" >&2; exit 2; fi
 if [[ ${#LATENT_STEPS[@]} -eq 0 ]]; then echo "[ERROR] No latent steps selected" >&2; exit 2; fi
@@ -193,8 +216,12 @@ run_one() {
   case "$mode" in
     m1) args+=(--do_test_latent --latent_steps "$step") ;;
     m2)
-      args+=(--do_test_latent --latent_kv_select --latent_steps "$step" --top_layers "$TOP_LAYERS" --calib_size "$CALIB_SIZE")
-      [[ ${#EXPLICIT_LAYERS[@]} -gt 0 ]] && args+=(--layers_list "${EXPLICIT_LAYERS[@]}")
+      args+=(--do_test_latent --latent_kv_select --latent_steps "$step" --calib_size "$CALIB_SIZE")
+      if [[ ${#EXPLICIT_LAYERS[@]} -gt 0 ]]; then
+        args+=(--top_layers 0 --layers_list "${EXPLICIT_LAYERS[@]}")
+      else
+        args+=(--top_layers "$TOP_LAYERS")
+      fi
       ;;
     m3)
       args+=(--do_test --top_layers "$TOP_LAYERS" --calib_size "$CALIB_SIZE")
@@ -203,16 +230,18 @@ run_one() {
     m4)
       args+=(--do_test_latent --dual_kv_select --latent_steps "$step"
         --split_ratio "$SPLIT_RATIO" --context_top_ratio "$CONTEXT_TOP_RATIO" --latent_top_ratio "$LATENT_TOP_RATIO")
-      [[ "$TRACK_CONVERGENCE" == true ]] && args+=(--track_convergence)
       ;;
     m5)
       args+=(--do_test_latent --segmented_kv_select --latent_steps "$step"
         --context_top_ratio "$CONTEXT_TOP_RATIO" --latent_top_ratio "$LATENT_TOP_RATIO"
         --calib_size "$CALIB_SIZE")
-      [[ "$TRACK_CONVERGENCE" == true ]] && args+=(--track_convergence)
       ;;
     textmas) args+=(--do_test_nld --max_tokens_A "$MAX_TOKENS_A") ;;
   esac
+  if [[ "$mode" == m1 || "$mode" == m2 || "$mode" == m4 || "$mode" == m5 ]]; then
+    args+=(--latent_step_policy "$POLICY" "${ADAPTIVE_ARGS[@]}")
+    [[ "$TRACK_CONVERGENCE" == true ]] && args+=(--track_convergence)
+  fi
 
   TOTAL=$((TOTAL + 1))
   printf '[%s] %s/%s%s | B-think=%s | CMD: ' "$(date '+%H:%M:%S')" "$task" "$mode" "${step:+/N=$step}" "$think"

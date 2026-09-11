@@ -23,8 +23,9 @@ def build_response_record(
     layer_selection_mode: Optional[str] = None, selected_layers: Optional[list[int]] = None,
     context_layers: Optional[list[int]] = None, latent_layers: Optional[list[int]] = None,
     segmented_stats: Optional[Mapping[str, Any]] = None,
+    adaptive_stats: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
-    return {
+    record = {
         "schema_version": "v2",
         "metric_version": "v2",
         "idx": idx,
@@ -58,3 +59,7 @@ def build_response_record(
             "segmented_stats": dict(segmented_stats or {}),
         },
     }
+    if adaptive_stats is not None:
+        record.update(adaptive=dict(adaptive_stats), adaptive_schema_version=1,
+                      sample_id=adaptive_stats.get("sample_id"))
+    return record

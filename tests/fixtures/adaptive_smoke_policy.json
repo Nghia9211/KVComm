@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "status": "TEST_ONLY_NOT_CALIBRATED",
+  "controller": {"policy": "cosine", "max_steps": 8, "min_steps": 2, "interval": 1, "patience": 2},
+  "features": {"cosine_distance": 2.0},
+  "provenance": {"purpose": "Force stop at step 3 for nonzero finite hidden states; not a research threshold"}
+}
