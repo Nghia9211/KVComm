@@ -2,6 +2,30 @@
 # Sweep multiple tasks, latent steps, and communication modes through com_latent.py.
 set -uo pipefail
 
+# Policy workflow has its own explicit CLI; existing sweep modes are unchanged.
+previous=""
+policy_workflow=false
+for argument in "$@"; do
+  [[ "$previous" == --mode && "$argument" == policy ]] && policy_workflow=true
+  previous="$argument"
+done
+if [[ "$policy_workflow" == true ]]; then
+  pipeline_args=()
+  pipeline_python=""
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == --python ]]; then
+      [[ $# -ge 2 ]] || { echo 'Missing --python value' >&2; exit 2; }
+      pipeline_python="$2"; shift 2
+    else
+      pipeline_args+=("$1"); shift
+    fi
+  done
+  if [[ -z "$pipeline_python" ]]; then
+    pipeline_python="$(command -v python || command -v python3)" || exit 2
+  fi
+  exec "$pipeline_python" "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/run_adaptive_pipeline.py" "${pipeline_args[@]}"
+fi
+
 ALL_TASKS="hotpotqa medqa tmath multifieldqa_en twowikimqa musique qasper tipsheets countries repobench samsum mbppplus aime2024 aime2025 arc_challenge arc_easy gpqa gsm8k humanevalplus"
 CORE_TASKS="hotpotqa medqa tmath multifieldqa_en"
 QA_TASKS="hotpotqa multifieldqa_en twowikimqa musique qasper tipsheets countries"
@@ -37,6 +61,7 @@ usage() {
 Usage: bash sweep_latent.sh [OPTIONS]
 
 Modes:
+  policy                       End-to-end adaptive pipeline; --mode policy --help
   m1 | full_kv                 Full-KV LatentMAS
   m2 | selective_kv            Selective-KV LatentMAS
   m3 | kvcomm                  Regular KVComm, no latent steps
