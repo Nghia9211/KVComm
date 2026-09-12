@@ -9,6 +9,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import sys
+import shutil
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -152,7 +153,45 @@ def task_pipeline(a, task):
             '--output', directory / f'comparison_fixed_{n}.json'))
 
 
+def dispatch_regular_sweep(argv):
+    """Allow this entry point to launch ordinary modes without policy setup."""
+    mode = 'policy'
+    for i, arg in enumerate(argv):
+        if arg == '--mode' and i + 1 < len(argv):
+            mode = argv[i + 1]
+        elif arg.startswith('--mode='):
+            mode = arg.split('=', 1)[1]
+    if mode == 'policy':
+        return False
+    bash = shutil.which('bash')
+    if not bash:
+        raise ValueError('Ordinary sweep modes require Bash/Git Bash; use sweep_latent.sh')
+    forwarded = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == '--tasks':
+            values = []
+            i += 1
+            while i < len(argv) and not argv[i].startswith('--'):
+                values.append(argv[i])
+                i += 1
+            forwarded.extend(['--tasks', ' '.join(values)])
+            continue
+        if arg.startswith('--mode='):
+            forwarded.extend(['--mode', mode])
+        else:
+            forwarded.append(arg)
+        i += 1
+    subprocess.run([bash, str(ROOT / 'sweep_latent.sh'), '--python', sys.executable,
+                    *forwarded], cwd=ROOT, check=True)
+    return True
+
+
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if dispatch_regular_sweep(argv):
+        return
     a = parse_args(argv)
     if not a.dry_run:
         a.output.mkdir(parents=True, exist_ok=False)

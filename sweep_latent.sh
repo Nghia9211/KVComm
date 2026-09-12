@@ -6,7 +6,13 @@ set -uo pipefail
 previous=""
 policy_workflow=false
 for argument in "$@"; do
-  [[ "$previous" == --mode && "$argument" == policy ]] && policy_workflow=true
+  if [[ "$previous" == --mode ]]; then
+    policy_workflow=false
+    [[ "$argument" == policy ]] && policy_workflow=true
+  elif [[ "$argument" == --mode=* ]]; then
+    policy_workflow=false
+    [[ "$argument" == --mode=policy ]] && policy_workflow=true
+  fi
   previous="$argument"
 done
 if [[ "$policy_workflow" == true ]]; then
@@ -52,7 +58,17 @@ ALLOW_B_THINK="auto"
 SHIFT_BACK=true
 DRY_RUN=false
 PYTHON_OVERRIDE=""
-POLICY="fixed"
+POLICY="cosine" # fixed = ordinary sweep; cosine/hidden_value = automatic policy pipeline
+# Automatic pipeline settings (STEPS applies only to fixed or an existing JSON).
+POLICY_CALIBRATION=5
+POLICY_VALIDATION=5
+POLICY_HOLDOUT=10
+POLICY_MAX_STEPS=80
+POLICY_MIN_STEPS=10
+POLICY_INTERVAL=5
+POLICY_PATIENCE=2
+POLICY_BUDGET_FIXED_STEPS=40
+POLICY_OUTPUT="" # empty = unique timestamped directory under snapshots
 CONTROLLER_ARGS=()
 LATENT_RUN_ARGS=()
 
@@ -111,6 +127,7 @@ while [[ $# -gt 0 ]]; do
     --task|--tasks) TASK_INPUT="$2"; shift 2 ;;
     --steps|--latent_steps) STEPS="$2"; shift 2 ;;
     --mode) MODE="$2"; shift 2 ;;
+    --mode=*) MODE="${1#*=}"; shift ;;
     --device) DEVICE="$2"; shift 2 ;;
     --device_B) DEVICE_B="$2"; shift 2 ;;
     --seed) SEED="$2"; shift 2 ;;
@@ -165,7 +182,17 @@ esac
 read -r -a TASKS <<< "$TASK_STRING"
 read -r -a LATENT_STEPS <<< "$STEPS"
 read -r -a EXPLICIT_LAYERS <<< "$LAYERS_LIST"
-if [[ "$POLICY" != fixed ]]; then
+AUTO_POLICY=false
+HAS_POLICY_JSON=false
+for argument in "${CONTROLLER_ARGS[@]}"; do
+  [[ "$argument" == --latent_policy_config ]] && HAS_POLICY_JSON=true
+done
+if [[ "$POLICY" != fixed && "$HAS_POLICY_JSON" == false && ( "$MODE" == m1 || "$MODE" == m2 || "$MODE" == both ) ]]; then
+  AUTO_POLICY=true
+fi
+if [[ "$POLICY" != fixed && ( "$MODE" == textmas || "$MODE" == m3 ) ]]; then
+  echo "[WARN] Ignoring latent controller settings for $MODE; no policy calibration is run." >&2
+elif [[ "$POLICY" != fixed ]]; then
   if [[ "$MODE" != m1 && "$MODE" != m2 && "$MODE" != both ]]; then
     echo "[ERROR] Adaptive supports only m1/m2/both" >&2; exit 2
   fi
@@ -189,6 +216,35 @@ else
 fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAIN_SCRIPT="$SCRIPT_DIR/com_latent.py"
+
+if [[ "$AUTO_POLICY" == true ]]; then
+  if [[ "$MODEL_A" != "$MODEL_B" || "$BATCH_SIZE" != 1 || "$SHIFT_BACK" != true ]]; then
+    echo '[ERROR] Automatic policy requires identical A/B models, batch_size=1 and shift_back.' >&2; exit 2
+  fi
+  if [[ ${#CONTROLLER_ARGS[@]} -gt 0 || ${#LATENT_RUN_ARGS[@]} -gt 0 || "$LIMIT" != 0 ]]; then
+    echo '[ERROR] For automatic calibration edit POLICY_* settings; omit evaluation-only flags and --limit. Use --mode policy --help for advanced pipeline options.' >&2; exit 2
+  fi
+  policy_modes=("$MODE")
+  [[ "$MODE" == both ]] && policy_modes=(m1 m2)
+  policy_root="${POLICY_OUTPUT:-$SCRIPT_DIR/snapshots/policy_${POLICY}_$(date '+%Y%m%d_%H%M%S')_$$}"
+  think_setting=auto
+  [[ "$ALLOW_B_THINK" == true ]] && think_setting=yes
+  [[ "$ALLOW_B_THINK" == false ]] && think_setting=no
+  for policy_mode in "${policy_modes[@]}"; do
+    pipeline_args=(--mode policy --tasks "${TASKS[@]}" --output "$policy_root/$policy_mode"
+      --kv_mode "$policy_mode" --policy "$POLICY" --model "$MODEL_A"
+      --device "$DEVICE" --device_B "$DEVICE_B" --seed "$SEED"
+      --calibration "$POLICY_CALIBRATION" --validation "$POLICY_VALIDATION" --holdout "$POLICY_HOLDOUT"
+      --max_steps "$POLICY_MAX_STEPS" --min_steps "$POLICY_MIN_STEPS"
+      --interval "$POLICY_INTERVAL" --patience "$POLICY_PATIENCE"
+      --budget_fixed_steps "$POLICY_BUDGET_FIXED_STEPS" --max_tokens_B "$MAX_TOKENS_B" --b_think "$think_setting")
+    [[ "$policy_mode" == m2 ]] && pipeline_args+=(--layers_list "${EXPLICIT_LAYERS[@]}")
+    [[ "$DRY_RUN" == true ]] && pipeline_args+=(--dry_run)
+    echo "Automatic policy: $POLICY + $policy_mode; output=$policy_root/$policy_mode (STEPS=$STEPS is not the adaptive cap)"
+    "$PYTHON" "$SCRIPT_DIR/scripts/run_adaptive_pipeline.py" "${pipeline_args[@]}" || exit $?
+  done
+  exit 0
+fi
 
 is_b_think_task() {
   case "$1" in

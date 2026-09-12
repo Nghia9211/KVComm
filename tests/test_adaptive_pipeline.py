@@ -9,6 +9,17 @@ from scripts import run_adaptive_pipeline as pipeline
 
 
 class PipelineTests(unittest.TestCase):
+    def test_regular_modes_bypass_policy_setup(self):
+        for mode in ['textmas', 'm1', 'm2', 'm3', 'all', 'both']:
+            with self.subTest(mode=mode), patch.object(pipeline.shutil, 'which', return_value='bash'), \
+                 patch.object(pipeline.subprocess, 'run') as run, \
+                 patch.object(pipeline, 'parse_args') as parse:
+                pipeline.main(['--mode', mode, '--tasks', 'hotpotqa', 'gsm8k', '--dry_run'])
+                parse.assert_not_called()
+                command = run.call_args.args[0]
+                self.assertIn('hotpotqa gsm8k', command)
+                self.assertIn(mode, command)
+
     def test_dry_run_is_read_only_and_covers_all_stages(self):
         with tempfile.TemporaryDirectory() as parent:
             output = Path(parent) / 'new'

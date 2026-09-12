@@ -1,5 +1,41 @@
 # Adaptive policy: một lệnh end-to-end
 
+## Chỉnh trực tiếp sweep_latent.sh rồi chạy
+
+`POLICY="cosine"` (mặc định mới) hoặc `POLICY="hidden_value"`, cùng `MODE="m1"`,
+tự chạy chia split → profile → chọn policy → holdout khi chưa cung cấp JSON.
+Chạy `./sweep_latent.sh`; kiểm tra trước bằng `bash sweep_latent.sh --dry_run`.
+Đổi `TASK_INPUT` để chọn task. Các biến `POLICY_CALIBRATION`, `POLICY_VALIDATION`,
+`POLICY_HOLDOUT` mặc định 5/5/10; `POLICY_MAX_STEPS=80` là cap, không phải `STEPS`.
+Ngưỡng tối thiểu/interval/patience/ngân sách chỉnh bằng các biến `POLICY_*` liền kề.
+`POLICY_OUTPUT` rỗng tạo thư mục timestamp mới. Đây vẫn chỉ là pilot nhỏ.
+
+`MODE="m2"` cần `LAYERS_LIST` đã khóa. `MODE="both"` chạy hai pipeline riêng,
+cùng task/seed/kích thước split nhưng tạo manifest riêng (không phải một manifest dùng chung).
+Nếu cần so sánh chặt chẽ phải đối chiếu ID/manifest hash giữa hai mode.
+Không tự chọn layer, không tự nới ngân sách nếu analyzer không tìm được policy.
+Các flag evaluation-only và `LIMIT` khác 0 bị từ chối trong automatic pipeline để tránh bị bỏ qua âm thầm.
+
+`POLICY="fixed"` chạy sweep latent thường theo `STEPS`. Nếu truyền JSON bằng
+`--latent_policy_config`, cosine/hidden_value chỉ evaluation như trước, không profile lại.
+TextMAS/m3 chạy độc lập, bỏ qua controller; `all` với controller adaptive vẫn bị từ chối:
+hãy chọn `fixed` cho sweep `all` hoặc `both` cho automatic policy.
+
+## Chạy mode thường, không calibration
+
+```bash
+bash sweep_latent.sh --mode textmas --tasks "hotpotqa gsm8k" --limit 2
+bash sweep_latent.sh --mode m1 --tasks hotpotqa --steps "10 40"
+bash sweep_latent.sh --mode m2 --tasks hotpotqa --layers_list "0 3 7"
+bash sweep_latent.sh --mode m3 --tasks hotpotqa
+```
+
+`python scripts/run_adaptive_pipeline.py --mode textmas --tasks hotpotqa --limit 2`
+cũng chuyển sang sweep thường (cần Bash/Git Bash), không yêu cầu output hay chia split.
+Không truyền các flag riêng của pipeline như `--calibration`, `--output`, `--kv_mode`
+cho mode thường. TextMAS/m3 bỏ qua controller latent với cảnh báo, không thay decoding.
+Thêm `--dry_run` để kiểm tra lệnh trước khi chạy model.
+
 Chạy từ thư mục `KVComm`, trong môi trường Python đã cài dependencies.
 
 ## 1. Xem lệnh trước (không tải model, không tạo output)
